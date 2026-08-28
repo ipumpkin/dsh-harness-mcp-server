@@ -1,14 +1,42 @@
 /**
  * dsh-harness-mcp-server — 在 Harness 内部启动 MCP server, 暴露 Harness 能力给 Hermes(大脑)。
  *
+ * 适配 dsh >= 0.1.1-rc.2(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
+ *
  * 工具集:
  *   - echo                : 验证 MCP server 连通
  *   - harness_list_tools  : 列出 Harness 工具注册表
+ *   - harness_status      : 系统水位总览(队列/agent 池/live 会话/运行时配置)
+ *   - model_list          : 列出 provider 的模型目录, 供按任务选模型
+ *   - workspace_list      : 列出工作区及其会话分组
  *   - agent_run           : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
  *   - task_inbox          : Hermes push 结构化任务(任务+记忆上下文)到 Harness 队列, 异步执行, 返回 taskId
  *   - task_result         : 取回任务的结构化结果(changes/verification/leftovers)
+ *   - task_list           : 列出最近任务(状态/目录/时间)+ 会话上下文占用, 便于批量轮询
+ *   - task_cancel         : 打断一个 running 任务(超时保护也走同一条 cancel 路径)
+ *   - session_list        : 列出可续接的会话(池/live/持久化三层)+ 上下文占用, 供外部决定续接哪个 sessionId
+ *   - session_read        : 读会话事件流(文本/工具调用/结果), 审计或续接前回顾
+ *   - session_close       : 显式退役一个池会话(持久化保留, 可凭 sessionId 续接)
+ *   - session_compact     : 把会话早期历史压缩成一段模型摘要(需宿主加载 compaction 后端, 如 dsh-compaction-basic)
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
+ *
+ * 上下文占用: session_list/task_list 通过 ctx.tokenMeter.measure(session) 输出事件数与启发式 token 数
+ * (固定密度定价, 与 dsh token-meter 同源); tokenMeter 服务缺失时该字段为 null。
+ *
+ * 会话复用策略(外部显式控制): 缺省按 cwd 复用常驻池会话(省上下文加载, 但历史随任务数增长);
+ * 外部可传 newSession:true 强制全新会话(旧会话退役但持久化保留), 或传 sessionId 精确续接, 或用
+ * session_list/session_close 自行盘点与退役 —— 是否复用完全由调用方决定。
+ *
+ * 客户端契约要点:
+ *  - agent_run 同步执行, 传 timeoutMs 超时自动转异步(返回 taskId, 用 task_result/task_wait/task_cancel 跟进);
+ *    所有任务(含同步)都注册进队列并回填真实 taskId, 均可查可取消。
+ *  - 进度汇报: task_wait/task_result/转异步响应/未完成任务行带 progress 字段
+ *    {status, events, toolCalls, currentTool:{name,args}, lastText}, 客户端可据此实时汇报"正在执行到哪一步"。
+ *  - 取消语义: agent 已就绪的任务走 cancel 钩子; 等锁/排队中的任务(task_cancel 置 cancelled)
+ *    在锁释放后执行前由 shouldAbort 检查中止 —— 任何状态的任务都可取消。
+ *  - 错误响应统一 {error:...} JSON + isError 标记。
+ *  - 忙会话保护: LRU 淘汰 / session_close / newSession 都不会 dispose 正在跑任务的 agent(软上限/拒绝/摘除)。
  *
  * sessionId 续接: 指定 sessionId 时按 本进程池 → live 会话(UI 手开)→ 持久化 resume 三级接管,
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
@@ -25,7 +53,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -40,6 +68,9 @@ import { resolve } from 'node:path'
 
 /** Cordis 插件名 */
 export const name = 'harness-mcp-server'
+
+/** 插件版本(与 package.json 同步; MCP initialize 时上报) */
+export const VERSION = '0.8.0'
 
 /**
  * 声明依赖的核心服务。
@@ -61,10 +92,12 @@ export interface Config {
   preset?: string
   /** 任务队列容量上限(默认 100) */
   maxQueue?: number
-  /** 已完成任务保留毫秒数(默认 10 分钟) */
+  /** 已完成任务保留毫秒数(默认 60 分钟, 对齐 taskTimeoutMs, 避免异步工作流丢结果) */
   taskTtlMs?: number
   /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
   maxAgents?: number
+  /** 单任务超时毫秒数, 超时自动 cancel 并回收部分输出(默认 60 分钟; 0 = 不限制) */
+  taskTimeoutMs?: number
   /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
   authToken?: string
   /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
@@ -78,8 +111,9 @@ const runtimeConfig = {
   model: '',
   preset: 'standard',
   maxQueue: 100,
-  taskTtlMs: 10 * 60 * 1000,
+  taskTtlMs: 60 * 60 * 1000,
   maxAgents: 8,
+  taskTimeoutMs: 60 * 60 * 1000,
   authToken: '',
   workspaceRoots: [] as string[],
 }
@@ -87,6 +121,11 @@ const runtimeConfig = {
 /** 工具回调统一返回 MCP text content */
 function out(content: string) {
   return { content: [{ type: 'text' as const, text: content }] }
+}
+
+/** 错误响应: 结构化 JSON 文本 + isError 标记(MCP 客户端可据此识别失败, 不写回记忆) */
+function err(content: string) {
+  return { content: [{ type: 'text' as const, text: content }], isError: true as const }
 }
 
 /** 工作区视图(ctx.get('workspaceRegistry')): 可选依赖, headless/无 workspace 插件的环境自动跳过 */
@@ -155,8 +194,24 @@ interface ResolvedAgent {
   disposeAfter?: boolean
 }
 
-/** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名 */
-async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string): Promise<ResolvedAgent> {
+/** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名。
+ *  fresh=true 且未传 sessionId 时: 跳过池命中, 先退役该 cwd 的旧池会话(dispose, 持久化保留), 再新建 ——
+ *  这是外部客户端显式控制「是否复用会话」的入口(agent_run/task_inbox 的 newSession 参数)。
+ *  modelOpts 提供按次调用的 provider/model 覆盖(只对新建/resume 的会话生效; 池命中的复用会话保持原模型)。 */
+async function getAgent(
+  ctx: Context,
+  cwd: string,
+  sessionId?: string,
+  title?: string,
+  fresh?: boolean,
+  modelOpts?: { provider?: string; model?: string },
+): Promise<ResolvedAgent> {
+  const effectiveModel = modelOpts?.model ?? runtimeConfig.model
+  const agentOptions = {
+    provider: modelOpts?.provider ?? runtimeConfig.provider,
+    // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
+    ...(effectiveModel ? { model: effectiveModel } : {}),
+  }
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
   if (sessionId) {
     // 先看本进程常驻池(指定 sessionId 时定位到对应 cwd 的常驻会话; 命中 LRU 移到末尾, 保留上游语义)
@@ -183,15 +238,12 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     try {
       handle = await ctx.agents.resume({
         resumeSessionId: sid,
-        agentOptions: {
-          provider: runtimeConfig.provider,
-          // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-          ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}),
-        },
+        agentOptions,
         setup: async (agentCtx) => {
-          // 同 create 路径: dsh rc.6 agent ctx 可能丢 scope tag, 检测不到就跳过挂载(降级为无工具 agent)
+          // dsh 0.1.1-rc.2 起已修复 rc.6 的 agent ctx 丢 scope 问题(agent-loop 会 createScope);
+          // 保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 不让 resume 整体崩溃。
           if (scopeOf(agentCtx) === undefined) {
-            console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
+            console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.1.1-rc.2 for full tool support')
             return
           }
           await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
@@ -204,6 +256,20 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     await attachSessionCwd(ctx, sid, handle.agent.session.header.cwd)
     return { sessionId: sid, handle, disposeAfter: true }
   }
+  // 显式全新会话: 跳过池命中 —— 先退役该 cwd 的旧池会话(保留持久化, 可凭 sessionId 续接)。
+  // 旧会话正在跑任务时不 dispose(不掐任务), 仅从池摘除; 其任务结束后 agent 仍 live, 可凭 sessionId 接管或 session_close。
+  if (fresh) {
+    const old = liveAgents.get(cwd)
+    if (old) {
+      liveAgents.delete(cwd)
+      sessionToCwd.delete(String(old.sessionId))
+      const status = (old.handle.agent as unknown as { status?: string }).status
+      if (status === 'idle') {
+        try { await old.handle.dispose() } catch { /* 退役失败不阻断新建 */ }
+      }
+    }
+    return createPoolAgent(ctx, cwd, title, agentOptions)
+  }
   const existing = liveAgents.get(cwd)
   if (existing) {
     // LRU: 命中则移到末尾(最近使用)
@@ -213,15 +279,25 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     await attachToWorkspace(ctx, await canonicalCwd(cwd), existing.sessionId)
     return existing
   }
-  // LRU 淘汰: 超过上限时逐出最久未用的会话
+  return createPoolAgent(ctx, cwd, title, agentOptions)
+}
+
+/** 新建一个 cwd 的常驻池会话: LRU 淘汰(只淘汰 idle 的) → agents.create(挂 preset) → 入池 → 工作区分组 → 可选命名 */
+async function createPoolAgent(ctx: Context, cwd: string, title?: string, agentOptions?: { provider?: string; model?: string }): Promise<ResolvedAgent> {
+  // LRU 淘汰: 超过上限时逐出最久未用的会话 —— 只淘汰 idle 的(agent.status === 'idle');
+  // 最旧一批都在忙时**不掐任务**, 允许池暂时超上限(软上限), 等任务落定后由下次淘汰回收。
   while (liveAgents.size >= runtimeConfig.maxAgents) {
-    const oldestKey = liveAgents.keys().next().value as string | undefined
-    if (oldestKey === undefined) break
-    const old = liveAgents.get(oldestKey)
-    liveAgents.delete(oldestKey)
+    let victimKey: string | undefined
+    for (const [key, rec] of liveAgents) {
+      const status = (rec.handle.agent as unknown as { status?: string }).status
+      if (status === 'idle') { victimKey = key; break }
+    }
+    if (victimKey === undefined) break
+    const old = liveAgents.get(victimKey)
+    liveAgents.delete(victimKey)
     if (old) {
       sessionToCwd.delete(String(old.sessionId))
-      try { (old.handle as { dispose?: () => void } | undefined)?.dispose?.() } catch { /* 忽略 */ }
+      try { await old.handle.dispose() } catch { /* 忽略 */ }
     }
   }
   const newSessionId = SessionId(randomUUID())
@@ -230,21 +306,17 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
   const canonical = await canonicalCwd(cwd)
   const handle = await ctx.agents.create({
     sessionId: newSessionId,
-    // 声明 preset: 为未来 Harness 版本消费 meta.agentPreset 做准备; 当前版本靠 setup 里手动 mount 兜底。
+    // meta.agentPreset 自 dsh 0.1.1-rc.2 起是官方字段(session header 记录/预置选择器消费);
+    // 但 preset 仍需在 setup 里显式 mount —— agentPresets 不做自动挂载, 只对未挂载 agent 告警。
     meta: { cwd: canonical, agentPreset: runtimeConfig.preset },
-    agentOptions: {
-      provider: runtimeConfig.provider,
-      // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-      ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}),
-    },
+    agentOptions,
     setup: async (agentCtx) => {
       // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)。
-      // dsh rc.6 的 agent-loop 有 bug: setup 收到的 agent ctx 丢失 scope tag,
-      // 导致 mount 抛 'refusing to compose an unscoped context'。
-      // 这里检测 scope, 无 scope 时跳过挂载(降级为无工具 agent), 避免 agent_run 整体崩溃。
-      // master 及后续版本已修复, 会正常走 mount。
+      // rc.6 的 agent-loop 曾把 setup 收到的 agent ctx 弄丢 scope tag(挂载会抛
+      // 'refusing to compose an unscoped context'); 0.1.1-rc.2 已修复。
+      // 这里保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 避免 agent_run 整体崩溃。
       if (scopeOf(agentCtx) === undefined) {
-        console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
+        console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.1.1-rc.2 for full tool support')
         return
       }
       await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
@@ -296,7 +368,12 @@ interface TaskResult {
   changes: string
   verification: string
   leftovers: string
+  /** true = 任务超时被自动 cancel(部分输出已回收, 可用 sessionId 续接) */
+  timeout?: boolean
 }
+
+/** 超时哨兵: 区分「超时打断」与 executeTask 内部的真实异常 */
+const TASK_TIMEOUT = Symbol('task-timeout')
 
 /** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
 function parseSummary(assistantText: string): { changes: string; verification: string; leftovers: string } {
@@ -337,25 +414,157 @@ function truncateResult(result: TaskResult): TaskResult {
   }
 }
 
-/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果 */
-async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string): Promise<TaskResult> {
+/** ctx.tokenMeter 的只读视图(可选服务; 未加载时返回 null) */
+interface TokenMeterView {
+  measure?: (session: unknown) => {
+    logRevision?: number
+    surfaceTokens?: number
+    totalTokens?: number
+  }
+}
+
+/** (provider:model) → 上下文窗口 token 数缓存; 解析失败缓存 null(不反复查询) */
+const modelWindowCache = new Map<string, number | null>()
+
+/** 经 ctx.llm.resolveModel 解析某 provider/model 的上下文窗口; 不可解析返回 null */
+async function modelWindowOf(ctx: Context, provider: string | undefined, model: string | undefined): Promise<number | null> {
+  if (!provider || !model) return null
+  const key = `${provider}:${model}`
+  const cached = modelWindowCache.get(key)
+  if (cached !== undefined) return cached
+  let window: number | null = null
+  try {
+    const llm = ctx.get('llm') as { resolveModel?: (p: string, m: string, s?: AbortSignal) => Promise<{ context?: { contextWindow?: number } }> } | undefined
+    const info = await llm?.resolveModel?.(provider, model)
+    window = info?.context?.contextWindow ?? null
+  } catch {
+    window = null
+  }
+  modelWindowCache.set(key, window)
+  return window
+}
+
+/** 会话生效的 provider/model: agent.options 优先, 其次 agentDefaultModel 默认选择, 否则插件配置 */
+function agentModelOf(ctx: Context, agent: { options?: { provider?: string; model?: string } } | undefined): { provider?: string; model?: string } {
+  if (agent?.options?.model) return { provider: agent.options.provider, model: agent.options.model }
+  const def = (ctx.get('agentDefaultModel') as { currentSelection?: () => { provider?: string; model?: string } } | undefined)?.currentSelection?.()
+  if (def?.model) return def
+  return { provider: runtimeConfig.provider, model: runtimeConfig.model || undefined }
+}
+
+/** 完整上下文占用: 事件数 + 表面 token 数 + 最近请求压力 + 模型窗口 + 占用比(百分比, 1 位小数);
+ *  tokenMeter 缺失返回 null; 窗口不可解析时 window/ratio 为 null。 */
+async function contextUsage(
+  ctx: Context,
+  session: unknown,
+  agent?: { options?: { provider?: string; model?: string } },
+): Promise<{ events: number; tokens: number; pressure: number; window: number | null; ratio: number | null } | null> {
+  try {
+    const m = (ctx.get('tokenMeter') as TokenMeterView | undefined)?.measure?.(session)
+    if (!m) return null
+    const events = m.logRevision ?? 0
+    const tokens = m.surfaceTokens ?? 0
+    const pressure = m.totalTokens ?? 0
+    const { provider, model } = agentModelOf(ctx, agent)
+    const window = await modelWindowOf(ctx, provider, model)
+    const ratio = window && window > 0 ? Math.round((tokens / window) * 1000) / 10 : null
+    return { events, tokens, pressure, window, ratio }
+  } catch {
+    return null
+  }
+}
+
+/** 按 sessionId 找 live agent(池优先, 其次 ctx.agents; 都不是返回 undefined) */
+function liveAgentFor(ctx: Context, sessionId: string | undefined): { session: unknown; options?: { provider?: string; model?: string } } | undefined {
+  if (!sessionId) return undefined
+  const cwd = sessionToCwd.get(sessionId)
+  const pooled = cwd !== undefined ? liveAgents.get(cwd) : undefined
+  if (pooled) return pooled.handle.agent
+  return ctx.agents.get(SessionId(sessionId))
+}
+
+/** 任务进行中的步骤信息: 从任务开始点(baseline)之后的日志增量里提取, 供客户端汇报进度 */
+function taskProgressOf(ctx: Context, item: TaskItem): Record<string, unknown> {
+  const info: Record<string, unknown> = { status: item.status }
+  if (item.status === 'queued') return info
+  const session = liveAgentFor(ctx, item.sessionId)?.session as { log?: unknown[] } | undefined
+  if (!session?.log) return info
+  const slice = session.log.slice(item.baseline ?? 0)
+  let toolCalls = 0
+  let currentTool: { name: string; args: string } | undefined
+  let lastText = ''
+  for (const ev of slice) {
+    const e = ev as { type?: string; data?: { name?: string; arguments?: string; message?: { content?: { type?: string; text?: string }[] } } }
+    if (e.type === 'tool/call') {
+      toolCalls++
+      currentTool = { name: e.data?.name ?? '?', args: String(e.data?.arguments ?? '').slice(0, 300) }
+    } else if (e.type === 'assistant/message' || e.type === 'user/message') {
+      const text = (e.data?.message?.content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join(' ').trim()
+      if (text) lastText = text.slice(0, 200)
+    }
+  }
+  info.events = slice.length
+  info.toolCalls = toolCalls
+  if (currentTool) info.currentTool = currentTool
+  if (lastText) info.lastText = lastText
+  return info
+}
+
+/** 从任意事件/消息对象递归收集文本(容错遍历; 供结果提取与 session_read 复用) */
+function extractText(obj: unknown, out: string[]): void {
+  if (Array.isArray(obj)) { obj.forEach((x) => extractText(x, out)); return }
+  if (obj && typeof obj === 'object') {
+    const rec = obj as Record<string, unknown>
+    if (typeof rec.text === 'string' && rec.text.trim()) out.push(rec.text)
+    if (typeof rec.content === 'string' && rec.content.trim()) out.push(rec.content)
+    for (const v of Object.values(rec)) extractText(v, out)
+  }
+}
+
+/** cwd 白名单校验: 配置了 workspaceRoots 时只允许在列出的目录下干活(防路径穿越); 未配置恒放行 */
+function cwdAllowed(workdir: string): boolean {
+  if (runtimeConfig.workspaceRoots.length === 0) return true
+  return runtimeConfig.workspaceRoots.some((root) => {
+    const r = resolve(root)
+    return workdir === r || workdir.startsWith(r + '/')
+  })
+}
+
+/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
+ *  opts.onAgent 在 agent 就绪后回调一次, 供 task_cancel 注册打断钩子;
+ *  opts.fresh = true 且未传 sessionId 时强制全新会话(跳过池复用, 见 getAgent);
+ *  opts.provider/model 为按次调用的模型覆盖(对新建/resume 会话生效);
+ *  opts.timeoutMs 为按次执行超时(覆盖全局 taskTimeoutMs; 0 = 不限制);
+ *  opts.shouldAbort 在等锁后/执行前检查, 支持取消"排队/等锁中"的任务(agent 未就绪时 task_cancel 置 cancelled)。 */
+async function executeTask(
+  ctx: Context,
+  task: string,
+  context: string,
+  cwd: string,
+  resumeSessionId?: string,
+  title?: string,
+  opts?: {
+    onAgent?: (agent: Agent) => void
+    fresh?: boolean
+    provider?: string
+    model?: string
+    timeoutMs?: number
+    shouldAbort?: () => boolean
+  },
+): Promise<TaskResult> {
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
   const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())
   // cwd 白名单: 配置了 workspaceRoots 时, 只允许在列出的目录下干活(防路径穿越)
-  if (runtimeConfig.workspaceRoots.length > 0) {
-    const allowed = runtimeConfig.workspaceRoots.some((root) => {
-      const r = resolve(root)
-      return workdir === r || workdir.startsWith(r + '/')
-    })
-    if (!allowed) {
-      throw new Error(`cwd not allowed (outside workspaceRoots): ${workdir}`)
-    }
+  if (!cwdAllowed(workdir)) {
+    throw new Error(`cwd not allowed (outside workspaceRoots): ${workdir}`)
   }
   // sessionId 用 session 锁, 否则用 cwd 锁——都防同一 agent 会话被并发 followup
   const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
   return withLock(lockKey, async () => {
-    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title)
+    // 取消检查: 任务在等锁期间被 task_cancel(agent 未就绪路径)置了 cancelled → 执行前中止, 不启动 agent
+    if (opts?.shouldAbort?.()) throw new Error('task cancelled')
+    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title, opts?.fresh, { provider: opts?.provider, model: opts?.model })
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
@@ -369,7 +578,31 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     handle.agent.followup(
       createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
     )
-    await handle.agent.whenIdle()
+    // agent 就绪: 通知调用方(供 task_cancel 注册打断钩子)
+    opts?.onAgent?.(handle.agent)
+
+    // 超时保护: whenIdle 无限等待会让 MCP 客户端挂死; 到点后 cancel 打断本轮, 回收部分输出
+    // (per-task timeoutMs 覆盖全局 taskTimeoutMs)
+    const taskTimeout = opts?.timeoutMs ?? runtimeConfig.taskTimeoutMs
+    let timedOut = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        handle.agent.whenIdle(),
+        new Promise<never>((_resolve, reject) => {
+          if (taskTimeout > 0) {
+            timer = setTimeout(() => { timedOut = true; reject(TASK_TIMEOUT) }, taskTimeout)
+          }
+        }),
+      ])
+    } catch (e) {
+      if (e !== TASK_TIMEOUT) throw e
+      // cancel 丢弃未开始的排队输入, 中止活动回合; 之后 whenIdle 很快落定
+      try { handle.agent.cancel({ kind: 'hook', reason: 'harness-mcp-timeout' }) } catch { /* 打断失败不阻断回收 */ }
+      await handle.agent.whenIdle()
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
 
     // 结构化读输出
     const result: TaskResult = {
@@ -378,15 +611,6 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     }
     try {
       const log = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).slice(baseline)
-      const extractText = (obj: unknown, out: string[]): void => {
-        if (Array.isArray(obj)) { obj.forEach((x) => extractText(x, out)); return }
-        if (obj && typeof obj === 'object') {
-          const rec = obj as Record<string, unknown>
-          if (typeof rec.text === 'string' && rec.text.trim()) out.push(rec.text)
-          if (typeof rec.content === 'string' && rec.content.trim()) out.push(rec.content)
-          for (const v of Object.values(rec)) extractText(v, out)
-        }
-      }
       for (const e of log) {
         const ev = e as {
           type?: string
@@ -422,6 +646,18 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     result.verification = summary.verification
     result.leftovers = summary.leftovers
 
+    // C3 兜底: 模型没按格式吐 JSON 时, 用最近工具结果摘要填充 changes(尽力而为, 不再全空)
+    if (!result.changes && !result.verification && !result.leftovers) {
+      const last = result.toolResults.slice(-5).join('\n').slice(0, 1500)
+      if (last) result.changes = `(heuristic from tool output) ${last}`
+    }
+
+    // 超时标注: leftovers 为空时补一句引导, 提示可用 sessionId 续接
+    result.timeout = timedOut
+    if (timedOut && !result.leftovers) {
+      result.leftovers = '任务超时被自动取消, 以上为部分进展; 可用 sessionId 续接继续'
+    }
+
     // resume 兜底分支: 尽力 flush 持久化, 再释放我们 resume 出来的句柄(不留给僵尸 live agent)
     if (disposeAfter) {
       try {
@@ -448,13 +684,27 @@ interface TaskItem {
   cwd: string
   sessionId?: string
   title?: string
+  /** true = 执行时强制全新会话(不池复用) */
+  newSession?: boolean
+  /** 按次调用的模型/provider 覆盖 */
+  model?: string
+  provider?: string
+  /** 按次执行超时(覆盖全局 taskTimeoutMs; 0 = 不限制) */
+  timeoutMs?: number
+  /** agent 就绪时的会话日志起点(供进度提取本任务增量) */
+  baseline?: number
   status: 'queued' | 'running' | 'done' | 'error'
   result?: TaskResult
   error?: string
+  /** true = 被 task_cancel 主动打断(区别于超时自动 cancel) */
+  cancelled?: boolean
   createdAt: number
   finishedAt?: number
 }
 const taskQueue = new Map<string, TaskItem>()
+
+/** taskId → 打断钩子: 任务进入 running 且 agent 就绪后注册, task_cancel 调用后清理 */
+const taskCancelHooks = new Map<string, () => Promise<void>>()
 
 /** 找会话 header: live 优先, 其次持久化 list(轻量元数据扫描, 不加载整日志) */
 async function findSessionHeader(ctx: Context, sessionId: SessionId): Promise<SessionHeader | undefined> {
@@ -520,35 +770,240 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     return out(JSON.stringify(names))
   })
 
-  // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)
+  // 运维总览: 队列/agent 池/live 会话/运行时配置 —— 外部客户端一眼看清系统水位
+  mcp.tool(
+    'harness_status',
+    '系统水位总览: 任务队列(排队/执行/完成/失败)、agent 常驻池、live 会话数、运行时配置。',
+    {},
+    async () => {
+      let queued = 0, running = 0, done = 0, error = 0
+      for (const t of taskQueue.values()) {
+        if (t.status === 'queued') queued++
+        else if (t.status === 'running') running++
+        else if (t.status === 'error') error++
+        else done++
+      }
+      const liveCount = ((ctx.agents as unknown as { list?: () => unknown[] }).list?.() ?? []).length
+      return out(JSON.stringify({
+        uptimeSec: Math.round(process.uptime()),
+        queue: { total: taskQueue.size, queued, running, done, error },
+        agentPool: { size: liveAgents.size, max: runtimeConfig.maxAgents, liveAgents: liveCount },
+        config: {
+          provider: runtimeConfig.provider,
+          model: runtimeConfig.model || '(dsh default)',
+          preset: runtimeConfig.preset,
+          maxQueue: runtimeConfig.maxQueue,
+          maxAgents: runtimeConfig.maxAgents,
+          taskTimeoutMs: runtimeConfig.taskTimeoutMs,
+          taskTtlMs: runtimeConfig.taskTtlMs,
+        },
+      }, null, 2))
+    },
+  )
+
+  // 模型目录: 供外部按任务挑选模型(llm.listModels; 窗口信息在会话上下文里按需解析)
+  mcp.tool(
+    'model_list',
+    '列出指定 provider 的可用模型目录(ctx.llm.listModels), 供外部按任务选模型。',
+    {
+      provider: z.string().optional().describe('provider 路由(默认 deepseek-official)'),
+    },
+    async ({ provider }) => {
+      const llm = ctx.get('llm') as { listModels?: (p: string) => Promise<{ id: string; name?: string; description?: string; inputModalities?: readonly string[] }[]> } | undefined
+      try {
+        const models = (await llm?.listModels?.(provider ?? runtimeConfig.provider)) ?? []
+        return out(JSON.stringify({
+          provider: provider ?? runtimeConfig.provider,
+          total: models.length,
+          models: models.map((m) => ({ id: m.id, name: m.name, description: m.description, inputModalities: m.inputModalities })),
+        }, null, 2))
+      } catch (e) {
+        return err(JSON.stringify({ error: `listModels failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+    },
+  )
+
+  // 工作区分组视图: 对齐 UI 侧 dsh-workspace, 便于按项目维度管理会话
+  mcp.tool(
+    'workspace_list',
+    '列出工作区及其会话分组(dsh-workspace 的花名册), 便于按项目维度管理; workspaceRegistry 未加载时报错。',
+    {},
+    async () => {
+      const registry = ctx.get('workspaceRegistry') as { list?: () => { id?: string; path?: string; title?: string; sessionIds?: readonly string[] }[] } | undefined
+      const list = registry?.list?.() ?? []
+      const workspaces = list.map((w) => ({
+        id: w.id, path: w.path, title: w.title,
+        sessionCount: w.sessionIds?.length ?? 0,
+        sessionIds: (w.sessionIds ?? []).slice(0, 100),
+      }))
+      return out(JSON.stringify({ total: workspaces.length, workspaces }, null, 2))
+    },
+  )
+
+  // 读会话事件流: 审计或续接前回顾 Harness 到底做了什么
+  mcp.tool(
+    'session_read',
+    '读会话的事件流(文本/工具调用/结果), 审计或续接前回顾。池/live 会话直读; 持久化会话临时 resume 读取后 flush 并释放。',
+    {
+      sessionId: z.string().describe('要读取的会话 id(池/live/持久化均可)'),
+      limit: z.number().int().min(1).max(500).optional().describe('最多返回最近事件数(默认 100)'),
+    },
+    async ({ sessionId, limit }) => {
+      let resolved: ResolvedAgent
+      try {
+        resolved = await getAgent(ctx, '', sessionId)
+      } catch (e) {
+        return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
+      }
+      const agent = resolved.handle.agent
+      try {
+        const log = ((agent.session as unknown as { log?: unknown[] }).log ?? [])
+        const events: { seq?: number; type?: string; text?: string }[] = []
+        for (const ev of log.slice(-(limit ?? 100))) {
+          const e = ev as { seq?: number; type?: string; data?: { message?: { content?: { type?: string; text?: string }[] }; name?: string; arguments?: string } }
+          const type = e.type
+          if (type === 'user/message' || type === 'assistant/message') {
+            const content = e.data?.message?.content
+            const text = (content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join('\n').slice(0, 4000)
+            events.push({ seq: e.seq, type, text: text || '(no text blocks)' })
+          } else if (type === 'tool/call') {
+            events.push({ seq: e.seq, type, text: `${e.data?.name ?? '?'}(${String(e.data?.arguments ?? '').slice(0, 2000)})` })
+          } else if (type === 'tool/result') {
+            const texts: string[] = []
+            extractText(e.data ?? ev, texts)
+            events.push({ seq: e.seq, type, text: texts.join('\n').slice(0, 3000) || '(empty result)' })
+          }
+        }
+        return out(JSON.stringify({ sessionId, total: log.length, returned: events.length, events }, null, 2))
+      } finally {
+        if (resolved.disposeAfter) {
+          try { await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(agent.session) } catch { /* ignore */ }
+          try { await resolved.handle.dispose() } catch { /* ignore */ }
+        }
+      }
+    },
+  )
+
+  // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)。
+  // 不传 sessionId 时 cwd 必填(避免误用 dsh 进程目录); 传 timeoutMs 可把长任务转成异步(返回 taskId 供轮询/取消)。
   mcp.tool(
     'agent_run',
-    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。',
+    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂); 可传 newSession:true 强制全新会话(不复用池); 可传 model/provider 按次选模型; 传 timeoutMs(毫秒)超时后自动转为异步任务(返回 taskId, 用 task_result/task_cancel/task_wait 跟进)。',
     {
       task: z.string().describe('要 Harness 执行的自然语言任务'),
       context: z.string().optional().describe('Hermes 记忆/上下文, 注入给 agent 参考'),
-      cwd: z.string().optional().describe('工作目录(默认当前)'),
+      cwd: z.string().optional().describe('工作目录(不传 sessionId 时必填; 可用 workspace_list 查看可用目录)'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
+      newSession: z.boolean().optional().describe('true = 强制全新会话(跳过该 cwd 的池复用, 旧会话退役但持久化保留, 仍可凭 sessionId 续接); 缺省 = 复用该 cwd 的常驻会话'),
+      model: z.string().optional().describe('本次任务使用的模型 id(对新建/resume 会话生效; 池复用的会话保持原模型)'),
+      provider: z.string().optional().describe('本次任务使用的 provider 路由(默认 deepseek-official)'),
+      timeoutMs: z.number().int().min(0).optional().describe('同步等待上限毫秒数(默认 taskTimeoutMs=60 分钟; 建议按客户端 HTTP 超时设小, 如 120000; 0 = 不转异步)'),
       title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
     },
-    async ({ task, context, cwd, sessionId, title }) => {
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
-      return out(JSON.stringify(truncateResult(result), null, 2))
+    async ({ task, context, cwd, sessionId, newSession, model, provider, timeoutMs, title }) => {
+      if (!cwd && !sessionId) {
+        return err(JSON.stringify({ error: 'cwd is required when not continuing a session (sessionId); see workspace_list for available roots' }))
+      }
+      const now = Date.now()
+      // TTL 清理: 删除已完成/失败且超时的任务
+      for (const [tid, t] of taskQueue) {
+        if ((t.status === 'done' || t.status === 'error') && t.finishedAt && now - t.finishedAt > runtimeConfig.taskTtlMs) {
+          taskQueue.delete(tid)
+        }
+      }
+      // 队列容量(与 task_inbox 一致): 活动任务超过上限则拒绝
+      let active = 0
+      for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') active++
+      if (active >= runtimeConfig.maxQueue) {
+        return err(JSON.stringify({ error: `task queue full (${active}/${runtimeConfig.maxQueue})` }))
+      }
+      // 统一注册为可查/可取消的任务条目: 同步完成时回填真实 taskId, 超时转异步后同一条目继续
+      const id = randomUUID()
+      const item: TaskItem = {
+        id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'running', createdAt: now,
+        ...(sessionId ? { sessionId } : {}),
+        ...(newSession ? { newSession: true } : {}),
+        ...(model ? { model } : {}),
+        ...(provider ? { provider } : {}),
+        ...(title ? { title } : {}),
+      }
+      taskQueue.set(id, item)
+      const background: Promise<TaskResult | undefined> = (async () => {
+        try {
+          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, {
+            fresh: item.newSession === true,
+            model: item.model,
+            provider: item.provider,
+            timeoutMs: item.timeoutMs,
+            shouldAbort: () => item.cancelled === true,
+            onAgent: (agent) => {
+              // 记录会话与日志起点: 供进度提取(本任务增量)与 task_list 上下文占用
+              item.sessionId = String(agent.session.id)
+              item.baseline = ((agent.session as unknown as { log?: unknown[] }).log ?? []).length
+              taskCancelHooks.set(id, async () => {
+                item.cancelled = true
+                agent.cancel({ kind: 'hook', reason: 'harness-mcp-task-cancel' })
+              })
+            },
+          })
+          item.result.taskId = id
+          item.sessionId = item.result.sessionId
+          item.status = 'done'
+          return item.result
+        } catch (e) {
+          item.error = String(e)
+          item.status = 'error'
+          return undefined
+        } finally {
+          taskCancelHooks.delete(id)
+          item.finishedAt = Date.now()
+        }
+      })()
+      const waitMs = timeoutMs ?? runtimeConfig.taskTimeoutMs
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const result = await Promise.race([
+          background,
+          new Promise<never>((_resolve, reject) => {
+            if (waitMs > 0) timer = setTimeout(() => reject(TASK_TIMEOUT), waitMs)
+          }),
+        ])
+        if (!result) return err(JSON.stringify({ error: `task failed: ${item.error ?? 'unknown'}` }))
+        return out(JSON.stringify(truncateResult(result), null, 2))
+      } catch (e) {
+        if (e !== TASK_TIMEOUT) throw e
+        // 转异步: 任务在后台继续跑, 客户端用 taskId 轮询/等待/取消; 附带当前进度供汇报
+        return out(JSON.stringify({
+          status: 'async',
+          taskId: id,
+          progress: taskProgressOf(ctx, item),
+          note: `task still running after ${waitMs}ms; poll via task_result / task_wait, or cancel via task_cancel`,
+        }, null, 2))
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
     },
   )
 
   // 异步 push 任务到队列(Hermes → Harness 任务入口)
   mcp.tool(
     'task_inbox',
-    'Hermes 把结构化任务(任务+记忆上下文)推入 Harness 队列, 异步执行, 返回 taskId。记忆喂编码的入口。',
+    'Hermes 把结构化任务(任务+记忆上下文)推入 Harness 队列, 异步执行, 返回 taskId。记忆喂编码的入口。可传 newSession:true 强制全新会话。',
     {
       task: z.string().describe('任务内容'),
       context: z.string().optional().describe('Hermes 记忆/上下文, 随任务注入给 agent'),
       cwd: z.string().optional().describe('工作目录'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
+      newSession: z.boolean().optional().describe('true = 强制全新会话(不复用该 cwd 的常驻会话); 缺省 = 复用'),
+      model: z.string().optional().describe('本次任务使用的模型 id(对新建/resume 会话生效)'),
+      provider: z.string().optional().describe('本次任务使用的 provider 路由(默认 deepseek-official)'),
+      timeoutMs: z.number().int().min(0).optional().describe('本次任务的执行超时毫秒数(默认 taskTimeoutMs=60 分钟; 超时自动 cancel 并回收部分输出; 0 = 不限制)'),
       title: z.string().optional().describe('新会话的标题(创建时命名)'),
     },
-    async ({ task, context, cwd, sessionId, title }) => {
+    async ({ task, context, cwd, sessionId, newSession, model, provider, timeoutMs, title }) => {
+      if (!cwd && !sessionId) {
+        return err(JSON.stringify({ error: 'cwd is required when not continuing a session (sessionId); see workspace_list for available roots' }))
+      }
       const now = Date.now()
       // TTL 清理: 删除已完成/失败且超时的任务
       for (const [tid, t] of taskQueue) {
@@ -560,46 +1015,165 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       let active = 0
       for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') active++
       if (active >= runtimeConfig.maxQueue) {
-        return out(JSON.stringify({ error: `task queue full (${active}/${runtimeConfig.maxQueue})` }))
+        return err(JSON.stringify({ error: `task queue full (${active}/${runtimeConfig.maxQueue})` }))
       }
       const id = randomUUID()
       const item: TaskItem = {
         id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
         ...(sessionId ? { sessionId } : {}),
+        ...(newSession ? { newSession: true } : {}),
+        ...(model ? { model } : {}),
+        ...(provider ? { provider } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(title ? { title } : {}),
       }
       taskQueue.set(id, item)
-      // 异步执行(不阻塞 Hermes)
+      // 异步执行(不阻塞 Hermes); agent 就绪后注册打断钩子, 供 task_cancel 主动打断
       void (async () => {
         item.status = 'running'
         try {
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title)
+          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, {
+            fresh: item.newSession === true,
+            model: item.model,
+            provider: item.provider,
+            timeoutMs: item.timeoutMs,
+            shouldAbort: () => item.cancelled === true,
+            onAgent: (agent) => {
+              // 记录会话与日志起点: 供进度提取(本任务增量)与 task_list 上下文占用
+              item.sessionId = String(agent.session.id)
+              item.baseline = ((agent.session as unknown as { log?: unknown[] }).log ?? []).length
+              taskCancelHooks.set(id, async () => {
+                item.cancelled = true
+                agent.cancel({ kind: 'hook', reason: 'harness-mcp-task-cancel' })
+              })
+            },
+          })
           item.result.taskId = id
+          item.sessionId = item.result.sessionId // 回填实际使用的会话, 供 task_list 附上下文占用/后续续接
           item.status = 'done'
         } catch (e) {
           item.error = String(e)
           item.status = 'error'
+        } finally {
+          taskCancelHooks.delete(id)
+          item.finishedAt = Date.now()
         }
-        item.finishedAt = Date.now()
       })()
       return out(JSON.stringify({ taskId: id, status: 'queued' }))
     },
   )
 
-  // 取回任务结果(结构化 changes/verification/leftovers)
+  // 取回任务结果(结构化 changes/verification/leftovers; 未完成时带进行中进度)
   mcp.tool(
     'task_result',
-    '取回 task_inbox 提交任务的结构化结果(changes/verification/leftovers)。',
+    '取回 task_inbox 提交任务的结构化结果(changes/verification/leftovers); 未完成时返回 progress 供汇报进度。',
     { taskId: z.string().describe('task_inbox 返回的 taskId') },
     async ({ taskId }) => {
       const item = taskQueue.get(taskId)
-      if (!item) return out(JSON.stringify({ error: `task not found: ${taskId}` }))
+      if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
       return out(JSON.stringify({
         taskId: item.id,
         status: item.status,
         error: item.error,
+        cancelled: item.cancelled === true || undefined,
+        progress: taskProgressOf(ctx, item),
         result: item.result ? truncateResult(item.result) : undefined,
       }, null, 2))
+    },
+  )
+
+  // 阻塞等待任务完成: 一次往返替代 N 次轮询(服务端每 500ms 查一次, 到 timeoutMs 或任务落定返回);
+  // 无论完成还是超时, 都附带 progress(进行中的步骤/已用工具/最新文本)供客户端汇报进度
+  mcp.tool(
+    'task_wait',
+    '阻塞等待一个任务完成/失败后返回其结果(服务端等待, 一次往返替代多次轮询); 超过 timeoutMs 返回当前状态与 progress(正在执行的步骤/工具调用)。客户端 HTTP 超时应大于 timeoutMs。',
+    {
+      taskId: z.string().describe('task_inbox / agent_run(转异步)返回的 taskId'),
+      timeoutMs: z.number().int().min(100).max(600000).optional().describe('等待上限毫秒数(默认 60000; 上限 10 分钟)'),
+    },
+    async ({ taskId, timeoutMs }) => {
+      const item = taskQueue.get(taskId)
+      if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
+      const wait = timeoutMs ?? 60000
+      const deadline = Date.now() + wait
+      while (item.status === 'queued' || item.status === 'running') {
+        const remain = deadline - Date.now()
+        if (remain <= 0) break
+        await new Promise((r) => setTimeout(r, Math.min(500, remain)))
+      }
+      return out(JSON.stringify({
+        taskId: item.id,
+        status: item.status,
+        error: item.error,
+        cancelled: item.cancelled === true || undefined,
+        progress: taskProgressOf(ctx, item),
+        result: item.result ? truncateResult(item.result) : undefined,
+      }, null, 2))
+    },
+  )
+
+  // 列出最近任务: 供批量轮询与队列观察(task_result 只能逐个查); 可按 sessionId 过滤
+  mcp.tool(
+    'task_list',
+    '列出最近的任务(taskId/状态/目录/时间/会话上下文/进行中进度), 便于批量轮询与观察队列; 按 createdAt 倒序, 可按 sessionId 过滤。',
+    {
+      limit: z.number().int().min(1).max(200).optional().describe('最多返回条数(默认 20)'),
+      sessionId: z.string().optional().describe('只返回使用了该会话的任务'),
+    },
+    async ({ limit, sessionId }) => {
+      const n = limit ?? 20
+      const items = [...taskQueue.values()]
+        .filter((t) => !sessionId || t.sessionId === sessionId)
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, n)
+      const tasks = []
+      for (const t of items) {
+        // 任务所用会话仍 live 时附上上下文占用(池优先; 已退役/未加载则 null); 未完成任务附进行中进度
+        const agent = liveAgentFor(ctx, t.sessionId)
+        const context = agent ? await contextUsage(ctx, agent.session, agent) : null
+        const progress = t.status === 'queued' || t.status === 'running' ? taskProgressOf(ctx, t) : undefined
+        tasks.push({
+          taskId: t.id,
+          status: t.status,
+          cwd: t.cwd,
+          sessionId: t.sessionId,
+          createdAt: t.createdAt,
+          finishedAt: t.finishedAt,
+          cancelled: t.cancelled === true || undefined,
+          timeout: t.result?.timeout === true || undefined,
+          error: t.error,
+          hasResult: t.result !== undefined,
+          context,
+          progress,
+        })
+      }
+      return out(JSON.stringify({ total: taskQueue.size, tasks }, null, 2))
+    },
+  )
+
+  // 打断一个 queued/running 任务: 与超时保护共用 agent.cancel 路径
+  mcp.tool(
+    'task_cancel',
+    '打断一个 queued/running 的任务(cancel agent 当前回合, 回收部分输出); 已结束的任务为幂等 no-op。',
+    { taskId: z.string().describe('task_inbox 返回的 taskId') },
+    async ({ taskId }) => {
+      const item = taskQueue.get(taskId)
+      if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
+      if (item.status === 'done' || item.status === 'error') {
+        return out(JSON.stringify({ taskId, status: item.status, cancelled: false, note: 'already finished' }))
+      }
+      const cancel = taskCancelHooks.get(taskId)
+      if (!cancel) {
+        // agent 未就绪(等锁/排队中): 置 cancelled 标记, executeTask 在锁释放后执行前检查并中止
+        item.cancelled = true
+        return out(JSON.stringify({ taskId, status: item.status, cancelled: true, note: 'cancel requested before agent started; will abort on start' }))
+      }
+      try {
+        await cancel()
+      } catch (e) {
+        return err(JSON.stringify({ error: `cancel failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+      return out(JSON.stringify({ taskId, status: item.status, cancelled: true }))
     },
   )
 
@@ -615,13 +1189,158 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       try {
         const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
         const session = sessions?.get?.(sessionId)
-        if (!session) return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+        if (!session) return err(JSON.stringify({ error: `session not found: ${sessionId}` }))
         const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
-        if (!st?.rename) return out(JSON.stringify({ error: 'sessionTitle service unavailable' }))
+        if (!st?.rename) return err(JSON.stringify({ error: 'sessionTitle service unavailable' }))
         const snapshot = st.rename(session, title) as { title?: string } | undefined
         return out(JSON.stringify({ ok: true, sessionId, title: snapshot?.title ?? title }))
       } catch (e) {
-        return out(JSON.stringify({ error: String(e) }))
+        return err(JSON.stringify({ error: String(e) }))
+      }
+    },
+  )
+
+  // 会话清单: 让外部客户端看清可续接的会话及其上下文占用, 决定续接哪个 sessionId / 是否开新会话 / 是否压缩
+  mcp.tool(
+    'session_list',
+    '列出可续接的会话(常驻池 / live / 持久化三层去重, 池优先), 含上下文占用 events/tokens/pressure/window/ratio(经 tokenMeter 测量 + llm 模型窗口); 持久化层未加载日志为 null。',
+    {},
+    async () => {
+      const rows = new Map<string, {
+        cwd?: string; source: 'pool' | 'live' | 'persisted'; title?: string
+        context: { events: number; tokens: number; pressure: number; window: number | null; ratio: number | null } | null
+      }>()
+      // 常驻池(本插件持有, 优先级最高; 上下文可直接测量)
+      for (const [cwd, rec] of liveAgents) {
+        rows.set(String(rec.sessionId), { cwd, source: 'pool', context: await contextUsage(ctx, rec.handle.agent.session, rec.handle.agent) })
+      }
+      // live 会话(ctx.agents.list(); 可读标题)
+      const titleSvc = ctx.get('sessionTitle') as { get?: (s: unknown) => { title?: string } | undefined } | undefined
+      const liveAgentsList = (ctx.agents as unknown as { list?: () => { session: { id: unknown; header?: { cwd?: string } }; options?: { provider?: string; model?: string } }[] }).list?.() ?? []
+      for (const agent of liveAgentsList) {
+        const id = String(agent.session.id)
+        const prev = rows.get(id)
+        rows.set(id, {
+          cwd: agent.session.header?.cwd ?? prev?.cwd,
+          source: prev?.source ?? 'live',
+          title: prev?.title ?? titleSvc?.get?.(agent.session)?.title,
+          context: prev?.context ?? await contextUsage(ctx, agent.session, agent),
+        })
+      }
+      // 持久化(未在上两层出现的会话; 日志未加载, 上下文未知)
+      const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<{ id: unknown; cwd?: string }[]> } | undefined
+      for (const h of (await persistence?.list?.()) ?? []) {
+        const id = String(h.id)
+        if (!rows.has(id)) rows.set(id, { cwd: h.cwd, source: 'persisted', context: null })
+      }
+      const sessions = [...rows.entries()]
+        .map(([sessionId, info]) => ({ sessionId, ...info }))
+        .sort((a, b) => (a.cwd ?? '').localeCompare(b.cwd ?? ''))
+      return out(JSON.stringify({ total: sessions.length, sessions }, null, 2))
+    },
+  )
+
+  // 显式退役池会话: 外部主动释放常驻句柄(会话保留在持久化, 仍可凭 sessionId 续接)
+  mcp.tool(
+    'session_close',
+    '显式退役一个常驻池会话(dispose 句柄并移出池; 会话保留在持久化, 仍可凭 sessionId 续接)。只能关闭本插件池里的会话; live/persisted 会话归其创建者所有, 返回 no-op。',
+    {
+      sessionId: z.string().describe('要退役的会话 id(来自 session_list 或 agent_run 结果的 sessionId 字段)'),
+    },
+    async ({ sessionId }) => {
+      let targetCwd: string | undefined
+      for (const [cwd, rec] of liveAgents) {
+        if (String(rec.sessionId) === sessionId) { targetCwd = cwd; break }
+      }
+      if (targetCwd === undefined) {
+        return out(JSON.stringify({ sessionId, closed: false, note: 'not in pool (pool only; live/persisted sessions are owned by their creator)' }))
+      }
+      const rec = liveAgents.get(targetCwd) as ResolvedAgent | undefined
+      if (!rec) return out(JSON.stringify({ sessionId, closed: false, note: 'already closed' }))
+      // 忙会话不掐: 正在跑任务的会话拒绝退役, 引导先取消任务
+      const status = (rec.handle.agent as unknown as { status?: string }).status
+      if (status !== 'idle') {
+        return out(JSON.stringify({ sessionId, cwd: targetCwd, closed: false, note: 'busy: session has a running task; use task_list / task_cancel first' }))
+      }
+      liveAgents.delete(targetCwd)
+      sessionToCwd.delete(sessionId)
+      try {
+        await rec.handle.dispose()
+      } catch (e) {
+        return err(JSON.stringify({ error: `dispose failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+      return out(JSON.stringify({ sessionId, cwd: targetCwd, closed: true, note: 'session persisted; resumable by sessionId' }))
+    },
+  )
+
+  // 上下文压缩: 把会话早期历史压成一段模型摘要(走官方 ctx.compaction.compactNow; 需宿主加载 compaction 后端)
+  mcp.tool(
+    'session_compact',
+    '把会话的早期历史压缩成一段模型摘要(走 ctx.compaction 的 compactNow; 需宿主已加载 compaction 后端如 dsh-compaction-basic)。压缩后上下文占用大幅下降, 被替换的细节仍保留在持久化日志里。会话忙碌(正在跑任务)时返回 busy 错误。',
+    {
+      sessionId: z.string().describe('要压缩的会话 id(池/live/持久化均可; 非 live 会临时 resume, 压缩后释放)'),
+    },
+    async ({ sessionId }) => {
+      const engine = ctx.get('compaction') as { compactNow?: (agent: unknown, signal: AbortSignal) => Promise<unknown> } | undefined
+      if (!engine?.compactNow) {
+        return err(JSON.stringify({ error: 'compaction service unavailable (is dsh-compaction-basic loaded?)' }))
+      }
+      // 三级解析会话(池 → live → 持久化 resume); resume 出的句柄在结束后 flush+dispose
+      let resolved: ResolvedAgent
+      try {
+        resolved = await getAgent(ctx, '', sessionId)
+      } catch (e) {
+        return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
+      }
+      const agent = resolved.handle.agent
+      const agentCtx = {
+        session: agent.session,
+        options: { provider: runtimeConfig.provider, ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}) },
+        runMaintenance: <T,>(task: (signal: AbortSignal) => Promise<T>) => agent.runMaintenance(task),
+      }
+      const before = await contextUsage(ctx, agent.session, agent)
+      const controller = new AbortController()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        const result = await (runtimeConfig.taskTimeoutMs > 0
+          ? Promise.race([
+              engine.compactNow(agentCtx as never, controller.signal),
+              new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => { controller.abort(); reject(TASK_TIMEOUT) }, runtimeConfig.taskTimeoutMs)
+              }),
+            ])
+          : engine.compactNow(agentCtx as never, controller.signal))
+        const r = result as {
+          compactionId?: string; summarySeq?: number; endSeq?: number
+          shadowedSeqs?: number[]; shadowedTokenCount?: number
+          summary?: { type?: string; text?: string }[]
+        }
+        const summaryText = (r.summary ?? []).filter((b) => b.type === 'text' && b.text).map((b) => b.text).join('\n').slice(0, 2000)
+        const after = await contextUsage(ctx, agent.session, agent)
+        return out(JSON.stringify({
+          ok: true, sessionId,
+          compactionId: r.compactionId,
+          summarySeq: r.summarySeq, endSeq: r.endSeq,
+          shadowedNodes: r.shadowedSeqs?.length ?? 0,
+          shadowedTokens: r.shadowedTokenCount,
+          before, after,
+          summary: summaryText,
+        }, null, 2))
+      } catch (e) {
+        if (e === TASK_TIMEOUT) {
+          return err(JSON.stringify({ error: `compaction timed out after ${runtimeConfig.taskTimeoutMs}ms` }))
+        }
+        const err2 = e as { name?: string; code?: string; message?: string }
+        return err(JSON.stringify({
+          error: `compact failed${err2.code ? ` (${err2.code})` : ''}: ${err2?.message ?? String(e)}`,
+          busy: err2.name === 'ManualCompactionError' && err2.code === 'busy',
+        }))
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        if (resolved.disposeAfter) {
+          try { await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(agent.session) } catch { /* ignore */ }
+          try { await resolved.handle.dispose() } catch { /* ignore */ }
+        }
       }
     },
   )
@@ -638,23 +1357,27 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       const sid = SessionId(sessionId)
       const header = await findSessionHeader(ctx, sid)
       if (header === undefined) {
-        return out(JSON.stringify({ error: `session not found: ${sessionId}(live 与持久化里都没有)` }))
+        return err(JSON.stringify({ error: `session not found: ${sessionId}(live 与持久化里都没有)` }))
       }
       const target = path ?? header.cwd
       if (target === undefined) {
-        return out(JSON.stringify({ error: `session ${sessionId} 的 header 没有 cwd, 官方 attachSession 无法校验, 不能归组` }))
+        return err(JSON.stringify({ error: `session ${sessionId} 的 header 没有 cwd, 官方 attachSession 无法校验, 不能归组` }))
       }
       try {
         const canonical = await realpath(target) // 目标必须是存在的目录, 否则 ENOENT
+        // 白名单一致化: 配置了 workspaceRoots 时, 归组目标同样受目录白名单约束
+        if (!cwdAllowed(canonical)) {
+          return err(JSON.stringify({ error: `path not allowed (outside workspaceRoots): ${canonical}` }))
+        }
         const ws = await ensureWorkspace(ctx, canonical)
-        if (!ws?.attachSession) return out(JSON.stringify({ error: 'workspaceRegistry unavailable' }))
+        if (!ws?.attachSession) return err(JSON.stringify({ error: 'workspaceRegistry unavailable' }))
         if (ws.sessionIds.includes(sid)) {
           return out(JSON.stringify({ sessionId, workspaceId: ws.id, workspacePath: ws.path, attached: false, note: 'already attached' }))
         }
         await ws.attachSession(sid)
         return out(JSON.stringify({ sessionId, workspaceId: ws.id, workspacePath: ws.path, attached: true }))
       } catch (e) {
-        return out(JSON.stringify({ error: `attach failed: ${(e as Error)?.message ?? String(e)}` }))
+        return err(JSON.stringify({ error: `attach failed: ${(e as Error)?.message ?? String(e)}` }))
       }
     },
   )
@@ -671,6 +1394,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.maxQueue !== undefined) runtimeConfig.maxQueue = config.maxQueue
   if (config.taskTtlMs !== undefined) runtimeConfig.taskTtlMs = config.taskTtlMs
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
+  if (config.taskTimeoutMs !== undefined) runtimeConfig.taskTimeoutMs = config.taskTimeoutMs
   if (config.authToken) runtimeConfig.authToken = config.authToken
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
@@ -708,7 +1432,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.10' })
+      const mcp = new McpServer({ name: 'harness', version: VERSION })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -769,6 +1493,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       sessionToCwd.clear()
       agentLocks.clear()
       taskQueue.clear()
+      taskCancelHooks.clear()
     }
   }, 'harness-mcp-server')
 }
