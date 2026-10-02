@@ -1,23 +1,29 @@
 /**
  * dsh-harness-mcp-server — 在 Harness 内部启动 MCP server, 暴露 Harness 能力给 Hermes(大脑)。
  *
- * 适配 dsh >= 0.1.1-rc.2(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
+ * 适配 dsh >= 0.2.0-rc.1(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
+ *
+ * 架构(v0.11.0): 「任务」层已降维为 **session + turn** —— 不再有 taskId/任务队列/内存态任务结果。
+ *  - 派活 = 往一个会话投喂一个 turn: session_send 组装 message 后 agent.followup() 立即返回(不等待/不超时阻塞)。
+ *  - 查询 = 主动去查: session_status / session_tail 以 **session log 为唯一事实源**。
+ *    live 会话读内存日志 + turnBoundaryProjection; 非 live(重启后)冷读持久化日志, 因此重启不丢状态。
+ *  - 结构化产物(changes/verification/leftovers)保留: 投喂模板要求 agent 输出一行 summary JSON,
+ *    session_status 从「最后一个 turn 边界内的 assistant 文本」parseSummary 提取。
  *
  * 工具集:
  *   - echo                : 验证 MCP server 连通
  *   - harness_list_tools  : 列出 Harness 工具注册表
- *   - harness_status      : 系统水位总览(队列/agent 池/live 会话/运行时配置)
+ *   - harness_status      : 系统水位总览(agent 池/live 会话/运行时配置)
  *   - model_list          : 列出 provider 的模型目录, 供按任务选模型
- *   - mode_list           : 列出会话模式目录(agent preset / 沙箱访问模式 / 审批策略 / 权限预设), 供按任务选模式
+ *   - preset_list         : 列出 agent preset(会话预设)目录, 并列出与预设定向相关的其余维度(沙箱访问模式 / 审批策略 / 权限预设)
  *   - workspace_list      : 列出工作区及其会话分组
- *   - agent_run           : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
- *   - task_inbox          : Hermes push 结构化任务(任务+记忆上下文)到 Harness 队列, 异步执行, 返回 taskId
- *   - task_result         : 取回任务的结构化结果(changes/verification/leftovers)
- *   - task_list           : 列出最近任务(状态/目录/时间)+ 会话上下文占用, 便于批量轮询
- *   - task_cancel         : 打断一个 running 任务(超时保护也走同一条 cancel 路径)
+ *   - session_send        : 【派活入口】把一条任务作为一个 turn 投喂进会话, 立即返回(不阻塞)
+ *   - session_status      : 【主动查询】phase/openTurn/lastTurn/prompts/context/summary, 以 session log 为准
+ *   - session_tail        : 【过程明细】按需拉取表面事件(消息文本/工具调用与结果/turn 边界)
+ *   - session_wait        : 【可选阻塞】单段 ≤240s 等 turn-end / idle / input; 超时返回 {timeout:true}
+ *   - session_cancel      : 打断会话当前回合(替代旧 task_cancel)
  *   - session_list        : 列出可续接的会话(池/live/持久化三层)+ 上下文占用, 供外部决定续接哪个 sessionId
  *   - session_read        : 读会话事件流(文本/工具调用/结果), 审计或续接前回顾
- *   - session_close       : 显式退役一个池会话(持久化保留, 可凭 sessionId 续接)
  *   - session_compact     : 把会话早期历史压缩成一段模型摘要(需宿主加载 compaction 后端, 如 dsh-compaction-basic)
  *   - pending_prompts     : 列出等待输入的弹窗(审批/提问)——MCP 调用方对 DSH 弹窗不再盲目
  *   - prompt_respond      : 响应弹窗(审批 approve/deny, 提问自由文本), 解除 agent 阻塞继续
@@ -26,67 +32,76 @@
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
  *
- * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh agent-presets,
+ * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh-agent-preset-registry,
  * 经 ctx.agentPresets.mount 挂载, meta.agentPreset 记入 session header)+ 沙箱访问模式(read-only /
  * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
  * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
- * workspace-write = workspace-write + ask)。agent_run/task_inbox 传 preset/mode/sandbox/approval 可在
- * 创建会话时应用模式(指定即强制全新会话, 避免后续再提权); 结果带 mode 快照验证生效, mode_list 列出可用模式。
+ * workspace-write = workspace-write + ask)。session_send 传 preset/mode/sandbox/approval 可在
+ * 创建会话时应用(指定即强制全新会话, 避免后续再提权); preset_list 列出可用 preset 及其定向的其余维度。
  *
- * 上下文占用: session_list/task_list 与任务 result/progress(agent_run/task_inbox/task_result/task_wait)
- * 经 ctx.tokenMeter.measure(session) 输出事件数与启发式 token 数(固定密度定价, 与 dsh token-meter 同源),
- * 并经 ctx.llm.resolveModelInfo 解析模型 contextWindow 得占用比 ratio=tokens/window(百分比);
- * tokenMeter 缺失时整个 context 为 null, 窗口不可解析时 window/ratio 为 null。
+ * 上下文占用: session_list 与 session_status(仅 live)经 ctx.tokenMeter.measure(session) 输出事件数与
+ * 启发式 token 数(固定密度定价, 与 dsh token-meter 同源), 并经 ctx.llm.resolveModelInfo 解析模型
+ * contextWindow 得占用比 ratio=tokens/window(百分比); tokenMeter 缺失时整个 context 为 null,
+ * 窗口不可解析时 window/ratio 为 null。非 live 会话没有 Session 对象可供计量, context 为 null。
  *
  * 会话复用策略(外部显式控制): 缺省按 cwd 复用常驻池会话(省上下文加载, 但历史随任务数增长);
  * 外部可传 newSession:true 强制全新会话(旧会话退役但持久化保留), 或传 sessionId 精确续接, 或用
- * session_list/session_close 自行盘点与退役 —— 是否复用完全由调用方决定。
+ * session_list 自行盘点(常驻池按 LRU 自动淘汰, 退役只由池策略决定) —— 是否复用完全由调用方决定。
  *
  * 客户端契约要点:
- *  - agent_run 同步执行, 传 timeoutMs 超时自动转异步(返回 taskId, 用 task_result/task_wait/task_cancel 跟进);
- *    所有任务(含同步)都注册进队列并回填真实 taskId, 均可查可取消。
- *  - 进度汇报: task_wait/task_result/转异步响应/未完成任务行带 progress 字段
- *    {status, events, toolCalls, currentTool:{name,args}, lastText}, 客户端可据此实时汇报"正在执行到哪一步"。
- *  - 取消语义: agent 已就绪的任务走 cancel 钩子; 等锁/排队中的任务(task_cancel 置 cancelled)
- *    在锁释放后执行前由 shouldAbort 检查中止 —— 任何状态的任务都可取消。
+ *  - session_send 立即返回 {sessionId, inboxDepth, openTurn}; 之后用 session_status 主动查询,
+ *    或用 session_wait 可选阻塞一段(≤240s)。没有 taskId, 也没有服务端排队与 TTL。
+ *  - 取消语义: session_cancel → agent.cancel({kind:'hook',reason:'harness-mcp-cancel'}), 回落 turn/end
+ *    reason.kind='aborted'(keepInbox=true 时保留未开始的排队输入)。
  *  - 错误响应统一 {error:...} JSON + isError 标记。
- *  - 忙会话保护: LRU 淘汰 / session_close / newSession 都不会 dispose 正在跑任务的 agent(软上限/拒绝/摘除)。
+ *  - 忙会话保护: LRU 淘汰与 newSession 都不会 dispose 正在跑 turn 的 agent(池软超上限, 任务落定后再回收)。
  *
  * sessionId 续接: 指定 sessionId 时按 本进程池 → live 会话(UI 手开)→ 持久化 resume 三级接管,
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
  * 启动时对存量未分组会话补挂一次(存量捞回)。
  *
- * 回路: Hermes 记忆 →(context)→ task_inbox → Harness agent 执行 → 结果进队列 → task_result → Hermes 持久化
+ * 回路: Hermes 记忆 →(context)→ session_send → Harness agent 执行一个 turn → 结果落 session log
+ *       → session_status/session_tail 主动查询 → Hermes 持久化
  */
 
 // ── Context 声明合并: 让 ctx.tools / ctx.llm / ctx.agents 有类型 ──
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import schemastery from '@deepseek-ai/schemastery'
-import { realpath } from 'node:fs/promises'
+import { readdir, readFile, realpath } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { homedir } from 'node:os'
 import http from 'node:http'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
+
+// ── 消息来源模块合并: dsh 0.2.0 起 MessageSourceMap 无兜底 'plugin' kind, ──
+// 每个生产者在自己模块里声明自己的 kind(dsh 官方做法, 见 dsh-plan-mode)。
+// kind 字符串保持 'harness-mcp-server'(消息生产者身份, 与包名无关)。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap { 'harness-mcp-server': { kind: 'harness-mcp-server' } & ContextFormed }
+}
 
 /** Cordis 插件名 */
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.10.3"
+export const VERSION = "0.13.0"
 
 /**
  * 声明依赖的核心服务。
@@ -95,32 +110,27 @@ export const VERSION = "0.10.3"
  */
 export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions']
 
-/** 插件配置 */
-export interface Config {
-  http?: boolean
-  port?: number
-  host?: string
-  /** 后端 provider(默认 deepseek-official) */
-  provider?: string
-  /** 执行任务的模型(默认 deepseek-v4-flash) */
-  model?: string
-  /** 挂载的 agent preset(默认 standard) */
-  preset?: string
-  /** 任务队列容量上限(默认 100) */
-  maxQueue?: number
-  /** 已完成任务保留毫秒数(默认 60 分钟, 对齐 taskTimeoutMs, 避免异步工作流丢结果) */
-  taskTtlMs?: number
-  /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
-  maxAgents?: number
-  /** 单任务超时毫秒数, 超时自动 cancel 并回收部分输出(默认 60 分钟; 0 = 不限制) */
-  taskTimeoutMs?: number
-  /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
-  authToken?: string
-  /** Bearer token 列表(任一命中即放行; 与 authToken 并存, 适合多客户端各自持一个 token) */
-  authTokens?: string[]
-  /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
-  workspaceRoots?: string[]
-}
+/**
+ * 插件配置 schema(dsh 0.2.0 形态): 命名空间 = profile 条目 id(`harness-mcp-server`)。
+ * 只有 `.volatile()` 字段会进自动生成的设置表单, 并可在设置页热改; 其余字段仍只从入口 config 读。
+ * 类型 `Config` 由 schema 推导(`Schemastery.TypeT`), 供 apply 签名等内部使用。
+ */
+export const Config = schemastery.object({
+  http: schemastery.boolean().default(true).description('是否启用 HTTP MCP 端点(默认 true)'),
+  port: schemastery.number().min(1).max(65535).default(8090).volatile().description('端口(1-65535, 默认 8090)'),
+  host: schemastery.string().min(1).default('127.0.0.1').volatile().description('监听地址(默认 127.0.0.1 仅本机; 0.0.0.0 暴露局域网, 建议同时启用 token)'),
+  provider: schemastery.string().default('deepseek-official').description('后端 provider(默认 deepseek-official)'),
+  model: schemastery.string().default('').description('执行任务的模型(留空跟随 dsh 默认)'),
+  preset: schemastery.string().default('standard').description('挂载的 agent preset(默认 standard)'),
+  maxAgents: schemastery.number().default(8).description('常驻 agent 会话上限(默认 8, LRU 淘汰)'),
+  taskTimeoutMs: schemastery.number().default(3600000).description('单次维护操作(如 session_compact)的超时毫秒数(默认 3600000; 0 = 不限制)'),
+  authToken: schemastery.string().default('').volatile().role('secret').description('Bearer token, 留空=无认证(仅本机时安全)'),
+  authTokens: schemastery.array(schemastery.string()).default([]).description('Bearer token 列表(任一命中即放行, 与 authToken 并存)'),
+  workspaceRoots: schemastery.array(schemastery.string()).default([]).description('cwd 白名单(设置后 agent 只能在列出的目录下干活)'),
+})
+
+/** 插件配置类型: 从上面的 schema 推导(volatile 字段为 `Volatile<T>`, 经 `.get()` 读取)。 */
+export type Config = Schemastery.TypeT<typeof Config>
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
 const runtimeConfig = {
@@ -128,8 +138,6 @@ const runtimeConfig = {
   // 空字符串 = 不覆盖 model, 跟随 dsh 的用户/默认设置; 显式配置则覆盖
   model: '',
   preset: 'standard',
-  maxQueue: 100,
-  taskTtlMs: 60 * 60 * 1000,
   maxAgents: 8,
   taskTimeoutMs: 60 * 60 * 1000,
   authToken: '',
@@ -157,42 +165,15 @@ function bearerTokenOk(header: string | undefined): boolean {
   })
 }
 
-// ── settings 命名空间: web 设置面板可配置的持久化子集(生效值 = schema 默认 → 入口 config base → 用户层) ──
-
-/** settings 命名空间名(web 设置卡片以它为键配对) */
-const SETTINGS_NAMESPACE = 'harness-mcp-server'
-
-/** 设置界面可编辑的持久化字段(入口 config 里 taskTimeoutMs 等其余字段不进 settings) */
-interface HarnessMcpSettings {
-  host: string
-  port: number
-  authToken: string
-}
-
-/** schemastery schema: 也是设置面板渲染与 wire 校验的依据 */
-const HarnessMcpSettingsSchema = schemastery.object({
-  host: schemastery.string().default('127.0.0.1'),
-  port: schemastery.number().default(8090),
-  authToken: schemastery.string().default(''),
-})
-
-/** ctx.settings 的结构化最小面(避免绑定宿主具体实现类型) */
-interface SettingsProviderLike {
-  register(
-    ns: ReturnType<typeof settingsNamespace>,
-    schema: unknown,
-    options?: {
-      base?: Partial<HarnessMcpSettings>
-      applies?: 'live' | 'restart'
-      validate?: (value: HarnessMcpSettings) => void
-    },
-  ): SettingsScopeLike
-}
-
-/** register 返回的命名空间 scope 的结构化最小面 */
-interface SettingsScopeLike {
-  get(): HarnessMcpSettings
-  watch(callback: (next: HarnessMcpSettings, prev: HarnessMcpSettings) => void | Promise<void>): () => void
+/**
+ * 读取一个配置字段: dsh 0.2.0 把 `.volatile()` 字段解析为 `Volatile<T>`(实现 `get()`)。
+ * 在 `ctx.effect` 里调用 `get()` 即订阅该字段的变更(保存设置后 effect 重跑);
+ * 仓库自带 harness 的桩 ctx 仍直接传普通值, 这里同时接受两种形态(行为与旧版一致)。
+ */
+function readField<T>(field: unknown, fallback: T): T {
+  const getter = (field as { get?: unknown } | null | undefined)?.get
+  if (typeof getter === 'function') return (getter as () => T).call(field)
+  return (field as T | undefined) ?? fallback
 }
 
 // ── 会话「模式」词汇: agent 预设 + 沙箱访问模式 + 审批策略 ──
@@ -335,7 +316,7 @@ interface ResolvedAgent {
 
 /** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名。
  *  fresh=true 且未传 sessionId 时: 跳过池命中, 先退役该 cwd 的旧池会话(dispose, 持久化保留), 再新建 ——
- *  这是外部客户端显式控制「是否复用会话」的入口(agent_run/task_inbox 的 newSession 参数)。
+ *  这是外部客户端显式控制「是否复用会话」的入口(session_send 的 newSession 参数)。
  *  modelOpts 提供按次调用的 provider/model 覆盖(只对新建/resume 的会话生效; 池命中的复用会话保持原模型)。
  *  modeOpts 提供按次的会话模式(agent preset + 沙箱访问模式 + 审批策略):
  *   - 指定模式且未传 sessionId 时恒强制全新会话 —— 池里复用的存量会话无法安全套用新模式(避免后续再提权的前提是
@@ -383,7 +364,7 @@ async function getAgent(
       // live 会话也补挂工作区(幂等): 用户手开的会话若尚未归组, 这里一并挂名
       await attachSessionCwd(ctx, sid, live.session.header.cwd)
       mcpSessionIds.add(sessionId) // 被 MCP 接管即视为 MCP 驱动(审批转达调用方)
-      // no-op dispose 兜底: executeTask 只在 disposeAfter 为 true 时调用 dispose
+      // no-op dispose 兜底: 只有 disposeAfter 为 true 的句柄才由调用方(投喂路径)负责释放
       return { sessionId: sid, handle: { agent: live, dispose: () => Promise.resolve() }, disposeAfter: false }
     }
     // live 也没有: 从持久化会话存储 resume 并接管(进程重启前的会话、LRU 淘汰后被释放的会话)
@@ -394,10 +375,10 @@ async function getAgent(
         resumeSessionId: sid,
         agentOptions,
         setup: async (agentCtx) => {
-          // dsh 0.1.1-rc.2 起已修复 rc.6 的 agent ctx 丢 scope 问题(agent-loop 会 createScope);
+          // dsh 0.2.0-rc.1 起已修复 rc.6 的 agent ctx 丢 scope 问题(agent-loop 会 createScope);
           // 保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 不让 resume 整体崩溃。
           if (scopeOf(agentCtx) === undefined) {
-            console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.1.1-rc.2 for full tool support')
+            console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.2.0-rc.1 for full tool support')
             return
           }
           await ctx.agentPresets.mount(agentCtx, resumePreset)
@@ -413,7 +394,7 @@ async function getAgent(
     return { sessionId: sid, handle, disposeAfter: true }
   }
   // 显式全新会话: 跳过池命中 —— 先退役该 cwd 的旧池会话(保留持久化, 可凭 sessionId 续接)。
-  // 旧会话正在跑任务时不 dispose(不掐任务), 仅从池摘除; 其任务结束后 agent 仍 live, 可凭 sessionId 接管或 session_close。
+  // 旧会话正在跑任务时不 dispose(不掐任务), 仅从池摘除; 其任务结束后 agent 仍 live, 可凭 sessionId 接管(等其空闲后由 LRU 回收)。
   if (fresh) {
     const old = liveAgents.get(cwd)
     if (old) {
@@ -465,17 +446,17 @@ async function createPoolAgent(ctx: Context, cwd: string, title?: string, agentO
   const presetId = modeOpts?.preset ?? runtimeConfig.preset
   const handle = await ctx.agents.create({
     sessionId: newSessionId,
-    // meta.agentPreset 自 dsh 0.1.1-rc.2 起是官方字段(session header 记录/预置选择器消费);
+    // meta.agentPreset 自 dsh 0.2.0-rc.1 起是官方字段(session header 记录/预置选择器消费);
     // 但 preset 仍需在 setup 里显式 mount —— agentPresets 不做自动挂载, 只对未挂载 agent 告警。
     meta: { cwd: canonical, agentPreset: presetId },
     agentOptions,
     setup: async (agentCtx) => {
       // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)。
       // rc.6 的 agent-loop 曾把 setup 收到的 agent ctx 弄丢 scope tag(挂载会抛
-      // 'refusing to compose an unscoped context'); 0.1.1-rc.2 已修复。
-      // 这里保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 避免 agent_run 整体崩溃。
+      // 'refusing to compose an unscoped context'); 0.2.0-rc.1 已修复。
+      // 这里保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 避免 session_send 整体失败。
       if (scopeOf(agentCtx) === undefined) {
-        console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.1.1-rc.2 for full tool support')
+        console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.2.0-rc.1 for full tool support')
         return
       }
       await ctx.agentPresets.mount(agentCtx, presetId)
@@ -524,36 +505,7 @@ async function withLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
   return next
 }
 
-/** 结构化任务结果 */
-interface TaskResult {
-  taskId: string
-  sessionId: string
-  /** 会话标题: 显式 title, 或新建会话时按任务内容自动生成的名字(sessionTitle 服务缺失时缺省) */
-  title?: string
-  assistantText: string
-  toolCalls: { name: string; args: string }[]
-  toolResults: string[]
-  changes: string
-  verification: string
-  leftovers: string
-  /** true = 任务超时被自动 cancel(部分输出已回收, 可用 sessionId 续接) */
-  timeout?: boolean
-  /** 模型/执行失败(配额耗尽/网络/非法参数等): errorCategory = model(LLM 错误码) | execution(通用 UNKNOWN), 有值即本轮失败 */
-  error?: { errorCode: string; errorMessage: string; errorCategory: 'model' | 'execution' }
-  /** 任务结束瞬间所用会话的上下文占用 events/tokens/pressure/window/ratio(tokenMeter 缺失为 null;
-   *  窗口不可解析时 window/ratio 为 null), 供调用方跟踪上下文占用/决定何时压缩或开新会话 */
-  context?: ContextUsage | null
-  /** 任务所用会话的生效模式(preset + 沙箱访问模式 + 审批策略; 本任务请求的模式已应用时 requested 与 effective 一致) */
-  mode?: {
-    preset: string
-    sandbox: string
-    approval: string
-    permissionPreset?: string
-    requested?: { preset?: string; sandbox?: string; approval?: string }
-  }
-}
-
-/** 超时哨兵: 区分「超时打断」与 executeTask 内部的真实异常 */
+/** 超时哨兵: 区分维护操作(如 session_compact)的「到点中止」与真实异常 */
 const TASK_TIMEOUT = Symbol('task-timeout')
 
 /** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
@@ -583,16 +535,6 @@ function parseSummary(assistantText: string): { changes: string; verification: s
     }
   }
   return empty
-}
-
-/** 分字段限长, 保证返回的永远是完整合法 JSON(避免 slice(-16000) 截断开头导致非法 JSON) */
-function truncateResult(result: TaskResult): TaskResult {
-  return {
-    ...result,
-    assistantText: result.assistantText.slice(0, 8000),
-    toolCalls: result.toolCalls.slice(0, 50).map((c) => ({ ...c, args: c.args.slice(0, 2000) })),
-    toolResults: result.toolResults.slice(0, 20).map((r) => r.slice(0, 2000)),
-  }
 }
 
 /** ctx.tokenMeter 的只读视图(可选服务; 未加载时返回 null) */
@@ -635,7 +577,7 @@ function agentModelOf(ctx: Context, agent: { options?: { provider?: string; mode
   return { provider: runtimeConfig.provider, model: runtimeConfig.model || undefined }
 }
 
-/** 会话上下文占用快照(任务 result/progress 与 session_list/task_list 通用形状) */
+/** 会话上下文占用快照(session_list / session_status 通用形状) */
 interface ContextUsage {
   events: number
   tokens: number
@@ -675,63 +617,35 @@ function liveAgentFor(ctx: Context, sessionId: string | undefined): { session: u
   return ctx.agents.get(SessionId(sessionId))
 }
 
-/** 任务进行中的步骤信息: 从任务开始点(baseline)之后的日志增量里提取, 供客户端汇报进度;
- *  同时附上任务会话的上下文占用 context(tokenMeter/窗口不可解析时为 null) */
-async function taskProgressOf(ctx: Context, item: TaskItem): Promise<Record<string, unknown>> {
-  const info: Record<string, unknown> = { status: item.status }
-  if (item.status === 'queued') { info.context = null; return info }
-  const agent = liveAgentFor(ctx, item.sessionId)
-  const session = agent?.session as { log?: unknown[] } | undefined
-  if (!session?.log) {
-    // 会话已退役/未加载: 无法读增量, 只附完成时快照(仍为 null 表示无法测量)
-    info.context = item.contextUsage ?? null
-    return info
-  }
-  const slice = session.log.slice(item.baseline ?? 0)
-  let toolCalls = 0
-  let currentTool: { name: string; args: string } | undefined
-  let lastText = ''
-  for (const ev of slice) {
-    const e = ev as { type?: string; data?: { name?: string; arguments?: string; message?: { content?: { type?: string; text?: string }[] } } }
-    if (e.type === 'tool/call') {
-      toolCalls++
-      currentTool = { name: e.data?.name ?? '?', args: String(e.data?.arguments ?? '').slice(0, 300) }
-    } else if (e.type === 'assistant/message' || e.type === 'user/message') {
-      const text = (e.data?.message?.content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join(' ').trim()
-      if (text) lastText = text.slice(0, 200)
-    }
-  }
-  info.events = slice.length
-  info.toolCalls = toolCalls
-  if (currentTool) info.currentTool = currentTool
-  if (lastText) info.lastText = lastText
+/** 等待输入的弹窗(审批/提问)一行: session_status.prompts 与 pending_prompts 共用的形状 */
+interface PromptRow {
+  type: 'approval' | 'question'
+  id: string
+  toolName?: string
+  reason?: string
+  questions?: unknown
+  note?: string
+}
 
-  // 等待输入感知: 审批(本插件应答链挂起)与提问(本插件 provider 挂起 / GUI 路由的挂起 ask_user_question)
-  // → status=waiting_input + prompts[], 供 MCP 调用方感知弹窗并响应(prompt_respond / web GUI)
-  const prompts: Record<string, unknown>[] = []
+/** 收集某会话当前挂起的弹窗: 审批(本插件应答链挂起) + 提问(本插件接管 / 本插件未接管时 GUI 应答链
+ *  挂起的 ask_user_question)。session 缺省(非 live 冷读路径)时只能看本插件的挂起表。 */
+function promptsFor(sessionId: string, session: unknown | undefined): PromptRow[] {
+  const prompts: PromptRow[] = []
   for (const pa of pendingApprovals.values()) {
-    if (pa.agentId === item.sessionId) {
+    if (pa.agentId === sessionId) {
       prompts.push({ type: 'approval', id: pa.promptId, toolName: pa.toolName, ...(pa.reason !== undefined ? { reason: pa.reason } : {}) })
     }
   }
   for (const pq of pendingQuestions.values()) {
-    if (pq.agentId === item.sessionId) prompts.push({ type: 'question', id: pq.promptId, questions: pq.questions })
+    if (pq.agentId === sessionId) prompts.push({ type: 'question', id: pq.promptId, questions: pq.questions })
   }
-  if (!questionsProviderOurs) {
+  if (!questionsProviderOurs && session !== undefined) {
     const detected = detectPendingAskUser(session)
     if (detected) {
-      prompts.push({ type: 'question', id: detected.id, questions: detected.questions, note: 'routed to the web GUI provider; answer in the DSH web UI' })
+      prompts.push({ type: 'question', id: detected.id, questions: detected.questions, note: 'not claimed by MCP (MCP only claims questions asked while it drives the session); answer it in the DSH web UI' })
     }
   }
-  if (prompts.length > 0) {
-    info.status = 'waiting_input'
-    info.prompts = prompts
-  }
-  // 上下文占用: 任务会话仍 live 时实时测量(池优先); 已退役/未加载则回退任务完成时快照
-  info.context = agent
-    ? await contextUsage(ctx, agent.session, agent)
-    : (item.contextUsage ?? null)
-  return info
+  return prompts
 }
 
 /** 从任意事件/消息对象递归收集文本(容错遍历; 供结果提取与 session_read 复用) */
@@ -770,7 +684,7 @@ function resolveAgentModel(ctx: Context, modelOpts?: { provider?: string; model?
   return { provider, model }
 }
 
-/** 待响应的提问 prompt(仅当本插件持有 user-questions provider 时产生; web GUI 占槽时提问走 GUI) */
+/** 待响应的提问 prompt(仅当本插件持有提问应答权 questionsProviderOurs 时产生; 否则提问走 web GUI 应答链) */
 interface PendingQuestion {
   promptId: string
   agentId: string
@@ -781,12 +695,59 @@ interface PendingQuestion {
 
 /** MCP 驱动的会话 id 集(创建/接管即标记): 标识「该会话由 MCP 创建或接管过」(历史事实, 不随任务结束消失) */
 const mcpSessionIds = new Set<string>()
-/** 当前有 MCP 任务正在执行的会话 id 集(mcpBusySessionIds ⊆ mcpSessionIds): 这是「会话当前是否有 MCP
- *  活跃任务」(正被 agent_run / task_inbox 驱动)的精确判据 —— executeTask 里 getAgent 成功返回后标记,
- *  任务结束(成功/超时/取消/异常统一汇聚到 return result 前的落点)清除。审批应答者必须同时满足
- *  「在 mcpSessionIds 且在 mcpBusySessionIds」才接管: 单看 mcpSessionIds 只能证明历史接管过, 用户经
- *  web UI 直接向该会话发消息触发的审批也会被误接管, 而 Hermes 并无任务在等 → 两端都收不到, 死锁。 */
-const mcpBusySessionIds = new Set<string>()
+/** sessionId → 尚未落定的 MCP turn 数(mcpBusySessionIds 的等价物): 「该会话当前是否有 MCP 在飞 turn」的
+ *  精确判据。session_send 投喂时 +1, 该会话每个 turn/end 事件 -1(减到 0 即摘除计数与观测器)。
+ *  审批应答者必须同时满足「在 mcpSessionIds 且计数 > 0」才接管: 单看 mcpSessionIds 只能证明历史接管过,
+ *  用户经 web UI 直接向该会话发消息触发的审批也会被误接管, 而 Hermes 并无任务在等 → 两端都收不到, 死锁。 */
+const mcpPendingTurns = new Map<string, number>()
+/** sessionId → turn/end 观测器的 disposer(每个有在飞 turn 的会话只挂一个, 计数归零即摘除) */
+const mcpTurnWatchers = new Map<string, () => void>()
+
+/**
+ * 该会话此刻是否真有 MCP 在飞 turn(审批/提问接管判据的第二半)。
+ * 计数只是提示, **会话日志才是权威**: 计数残留(取消时丢弃排队输入 / 事件丢失)绝不能让插件误接管一个
+ * 已经没有 MCP 工作的会话 —— 那正是「用户经 web UI 直发消息触发的弹窗被 MCP 抢走、两端都无人应答」
+ * 的死锁根因。因此两个条件都要满足:
+ *   ① mcpPendingTurns > 0(本会话有 session_send 投喂且尚未全部落定);
+ *   ② 此刻确实有活干 —— 有在飞 turn(日志折叠)或队列里还有待 claim 的输入。
+ * 拿不到 agent(只有 id)时无法核实 ②, 退化为只看 ①。
+ */
+function mcpTurnInFlight(sessionId: string, agent?: unknown): boolean {
+  if ((mcpPendingTurns.get(sessionId) ?? 0) <= 0) return false
+  const session = (agent as { session?: unknown } | undefined)?.session
+  if (session === undefined) return true
+  if (foldTurnState(sessionEventsOf(session)).openTurn !== null) return true
+  const inbox = (agent as { inbox?: { nextTurn?: readonly unknown[] } } | undefined)?.inbox
+  return (inbox?.nextTurn?.length ?? 0) > 0
+}
+
+/** 投喂后登记一个 MCP 在飞 turn(+1); 首次登记时挂一个「该会话下一次 turn/end 就 -1」的观测器 */
+function markMcpTurn(ctx: Context, sessionId: string): void {
+  mcpPendingTurns.set(sessionId, (mcpPendingTurns.get(sessionId) ?? 0) + 1)
+  if (mcpTurnWatchers.has(sessionId)) return
+  const off = onSessionEvent(ctx, sessionId, (event) => {
+    if ((event as { type?: string })?.type !== 'turn/end') return
+    const left = (mcpPendingTurns.get(sessionId) ?? 0) - 1
+    if (left > 0) { mcpPendingTurns.set(sessionId, left); return }
+    mcpPendingTurns.delete(sessionId)
+    mcpTurnWatchers.delete(sessionId)
+    off?.()
+  })
+  if (off === undefined) {
+    // 观测器挂不上(宿主事件不可用): 退化为「投喂即认为有一个在飞 turn」, 由下一次 session_send 覆盖
+    return
+  }
+  mcpTurnWatchers.set(sessionId, off)
+}
+
+/** 撤销一个 MCP 在飞 turn(投喂失败/主动取消时用; 减到 0 即摘除) */
+function unmarkMcpTurn(sessionId: string): void {
+  const left = (mcpPendingTurns.get(sessionId) ?? 0) - 1
+  if (left > 0) { mcpPendingTurns.set(sessionId, left); return }
+  mcpPendingTurns.delete(sessionId)
+  const off = mcpTurnWatchers.get(sessionId)
+  if (off !== undefined) { mcpTurnWatchers.delete(sessionId); try { off() } catch { /* ignore */ } }
+}
 /** 审批决策结果(DSH 词汇表的调用方可控子集; 'unavailable' 仅由 fail-closed 产生) */
 type ApprovalOutcomeValue = 'allowed-once' | 'rejected' | 'cancelled'
 /** ctx.approval 'approval/request' 请求的只读视图(鸭子类型, 避免引入 dsh-user-approval 依赖) */
@@ -807,7 +768,8 @@ const pendingApprovals = new Map<string, {
 }>()
 /** 待响应的提问 prompt */
 const pendingQuestions = new Map<string, PendingQuestion>()
-/** 提问 provider 是否由本插件持有(false = web GUI 占槽, 提问路由到 GUI) */
+/** 本插件是否持有提问应答权(true = 提问由 MCP 接管, prompt_respond 可答; false = 交给 web GUI 应答链)。
+ *  dsh-user-questions 两版宿主各有取得方式(旧版 registerProvider / 新版 waterfall listener), 详见 apply()。 */
 let questionsProviderOurs = false
 /** 会话级模型覆盖(sessionId → {provider?, model}): session_set_model 记录, resume 时同样生效 */
 const sessionModelOverrides = new Map<string, { provider?: string; model: string }>()
@@ -817,7 +779,7 @@ const sessionModelOverrides = new Map<string, { provider?: string; model: string
 /** 应用到会话的 agent preset 登记(sessionId → preset id): 创建/接管时记录, 供结果/会话列表回读生效 preset */
 const sessionPresetApplied = new Map<string, string>()
 
-/** ctx.agentPresets 的只读视图(鸭子类型, 避免硬依赖 dsh-agent-presets 内部类型) */
+/** ctx.agentPresets 的只读视图(鸭子类型, 避免硬依赖 dsh-agent-preset-registry 内部类型) */
 interface AgentPresetsView {
   list?: () => Promise<Array<{ id: string; name?: string; description?: string; trust?: string; order?: number; path?: string; broken?: string }>>
   resolve?: (id: string) => Promise<{ id: string; name?: string; description?: string; trust?: string; order?: number; path?: string; broken?: string } | undefined>
@@ -829,18 +791,40 @@ interface PermissionPresetsView {
   resolve?: (name: string) => { sandbox?: string; approval?: string; name?: string; description?: string } | undefined
   defaultPreset?: string
 }
-/** ctx.sandboxPolicy / ctx.approval 的只读视图(鸭子类型; 服务可选) */
+/** ctx.sandboxPolicy / ctx.approval 的只读视图(鸭子类型; 服务可选)。
+ *  0.2 依据: dsh-sandbox-policy 与 dsh-user-approval 的服务都暴露公开的 overrideOf(session)
+ *  ——「会话日志里最后一条 sandbox/mode / approval/policy 事件, 无则 undefined」, 即折叠加读取的权威入口。 */
 interface SandboxPolicyView {
   defaultMode?: string
   workspaceRoot?: string
+  overrideOf?: (session: unknown) => string | undefined
 }
 interface ApprovalServiceView {
   config?: { policy?: string }
+  overrideOf?: (session: unknown) => string | undefined
 }
 
-/** 从会话事件流折出生效沙箱模式(最后一条 sandbox/mode 事件; 无覆盖回退部署默认) */
-function effectiveSandboxModeOf(session: unknown, fallback: string): string {
-  const events = (session as { events?: Array<{ type?: string; data?: { mode?: string } }> }).events ?? []
+/** 0.2 的 Session 没有 events 公开属性、log 是私有字段; 同步读访问器 snapshotEvents()
+ *  已标记废弃但今天可用(dsh-session lib/types/index.d.ts:193)—— 统一走它,
+ *  拿不到时退回旧形状(events/log), 保证对老宿主仍可读。 */
+function sessionEventsOf(session: unknown): readonly unknown[] {
+  const s = session as { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[]; log?: readonly unknown[] }
+  if (typeof s.snapshotEvents === 'function') {
+    try { return s.snapshotEvents() ?? [] } catch { /* 访问器抛错时落回旧形状 */ }
+  }
+  return s.events ?? s.log ?? []
+}
+
+/** 会话生效的沙箱模式, 三层回退:
+ *  ① ctx.sandboxPolicy.overrideOf(session)(0.2 服务的权威折叠加读取);
+ *  ② snapshotEvents() 扫最后一条 sandbox/mode 追加事件(最后一条生效);
+ *  ③ 部署默认(调用方传入)。 */
+function effectiveSandboxModeOf(ctx: Context, session: unknown, fallback: string): string {
+  try {
+    const override = (ctx.get('sandboxPolicy') as SandboxPolicyView | undefined)?.overrideOf?.(session)
+    if (typeof override === 'string' && override !== '') return override
+  } catch { /* 服务不可用/抛错: 落回事件折叠加 */ }
+  const events = sessionEventsOf(session) as ReadonlyArray<{ type?: string; data?: { mode?: string } }>
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
     if (e?.type === 'sandbox/mode' && e.data?.mode) return e.data.mode
@@ -848,9 +832,16 @@ function effectiveSandboxModeOf(session: unknown, fallback: string): string {
   return fallback
 }
 
-/** 从会话事件流折出生效审批策略(最后一条 approval/policy 事件; 无覆盖回退部署默认) */
-function effectiveApprovalPolicyOf(session: unknown, fallback: string): string {
-  const events = (session as { events?: Array<{ type?: string; data?: { policy?: string } }> }).events ?? []
+/** 会话生效的审批策略, 三层回退:
+ *  ① ctx.approval.overrideOf(session)(0.2 服务的权威折叠加读取, 语义即「the session's effective policy fold」);
+ *  ② snapshotEvents() 扫最后一条 approval/policy 追加事件(最后一条生效);
+ *  ③ 部署默认(调用方传入)。 */
+function effectiveApprovalPolicyOf(ctx: Context, session: unknown, fallback: string): string {
+  try {
+    const override = (ctx.get('approval') as ApprovalServiceView | undefined)?.overrideOf?.(session)
+    if (typeof override === 'string' && override !== '') return override
+  } catch { /* 服务不可用/抛错: 落回事件折叠加 */ }
+  const events = sessionEventsOf(session) as ReadonlyArray<{ type?: string; data?: { policy?: string } }>
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
     if (e?.type === 'approval/policy' && e.data?.policy) return e.data.policy
@@ -892,8 +883,8 @@ function sessionModeOf(ctx: Context, sessionId: string, session: unknown, header
   permissionPreset?: string
 } {
   const defaults = deploymentModeDefaults(ctx)
-  const sandbox = effectiveSandboxModeOf(session, defaults.sandbox)
-  const approval = effectiveApprovalPolicyOf(session, defaults.approval)
+  const sandbox = effectiveSandboxModeOf(ctx, session, defaults.sandbox)
+  const approval = effectiveApprovalPolicyOf(ctx, session, defaults.approval)
   const permissionPreset = permissionPresetNameOf(ctx, sandbox, approval)
   return {
     preset: effectivePresetOf(sessionId, header),
@@ -984,7 +975,7 @@ async function resolveModeRequest(ctx: Context, input: { mode?: string; preset?:
   return out
 }
 
-/** agentPresets.list 的 id 清单(服务/方法缺失时返回空; 供报错提示与 mode_list 汇总) */
+/** agentPresets.list 的 id 清单(服务/方法缺失时返回空; 供报错提示与 preset_list 汇总) */
 async function listPresetIds(ctx: Context): Promise<string[]> {
   const agentPresets = ctx.get('agentPresets') as AgentPresetsView | undefined
   try {
@@ -994,9 +985,11 @@ async function listPresetIds(ctx: Context): Promise<string[]> {
   }
 }
 
-/** 从审批请求的会话事件里取审计 id(倒查最近一条匹配 callId 的 approval/asked, 与 web GUI 应答者同款); 找不到时合成兜底 id */
+/** 从审批请求的会话事件里取审计 id(倒查最近一条匹配 callId 的 approval/asked, 与 web GUI 应答者同款); 找不到时合成兜底 id。
+ *  0.2 依据: approval/asked 的 data 是 { id, toolName, callId?, reason? }(dsh-user-approval lib/types/types.d.ts:37),
+ *  且 Session 没有公开 events 属性 —— 事件经 snapshotEvents() 读。 */
 function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string; callId?: string }): string {
-  const events = ((req.agent.session as unknown as { events?: Array<{ type?: string; data?: { id?: string; callId?: string } }> }).events ?? [])
+  const events = sessionEventsOf(req.agent.session) as ReadonlyArray<{ type?: string; data?: { id?: string; callId?: string } }>
   const decided = new Set<string>()
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
@@ -1010,10 +1003,10 @@ function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string
   return `approval-${req.toolName}-${Date.now()}`
 }
 
-/** 检测挂起的 ask_user_question 工具调用(web GUI 持有提问 provider 时, 这是感知提问的唯一途径):
+/** 检测挂起的 ask_user_question 工具调用(本插件未接管该提问时, 这是感知它的唯一途径):
  *  倒查最后一条 ask_user_question 的 tool/call, 其后没有 tool/result 即为挂起。 */
 function detectPendingAskUser(session: unknown): { id: string; questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }> } | undefined {
-  const log = (session as { log?: unknown[] }).log ?? []
+  const log = sessionEventsOf(session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
   let callIdx = -1
   for (let i = log.length - 1; i >= 0; i--) {
     const e = log[i] as { type?: string; data?: { name?: string } }
@@ -1065,7 +1058,7 @@ function agentIdOf(agent: unknown): string | undefined {
 /**
  * 构造一条 form:'notice' 的 plugin 来源 user/message(web UI 折叠提示行专属呈现, 与官方插件同款)。
  *
- * 呈现契约(已对照 DSH web 前端 0.1.1-rc.2 源码 + 实际运行 GUI 的 client 包确认):
+ * 呈现契约(已对照 DSH web 前端 0.2.0-rc.1 源码 + 实际运行 GUI 的 client 包确认):
  *  - dsh-agent-loop 把 additionalContexts 里的消息原样 append 为 user/message(source 含 form/summary),
  *    即 form:'notice' 在 additionalContexts 路径上**会被保留**——因此无需 exec.deferContext 等替代方案;
  *  - dsh-client-runtime 的 contextForm(source) 读 source.form, KNOWN_FORMS 含 'notice'
@@ -1079,8 +1072,7 @@ function noticeUserMessage(text: string, summary: string) {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
-      plugin: 'harness-mcp-server',
+      kind: 'harness-mcp-server',
       form: 'notice' as const,
       summary: boundContextSummary(summary),
     },
@@ -1120,7 +1112,7 @@ function flushPromptNotices(agent: unknown, downstream: { kind?: string; additio
  * next-step inbox, 让 web UI 在用户响应(prompt_respond)之前就能看到, 不再等响应后才随
  * tools/post-execute flush 落地。
  *
- * 落点选型(对照 DSH 0.1.1-rc.2 核心源码逐一实证; 两份候选方案均被否决, 理由如下):
+ * 落点选型(对照 DSH 0.2.0-rc.1 核心源码逐一实证; 两份候选方案均被否决, 理由如下):
  *  - 方案A-2(拦截期直接 session.append user/message)被否决 —— 拦截时机恒处于
  *    「assistant(tool_calls) 已落日志、其 tool/result 未回」窗口: dsh-agent-loop 的 startCall
  *    先 appendToolCall 再 prepare/dispatch, 而 approval/request 在工具执行内触发
@@ -1160,285 +1152,515 @@ function notifyPromptIntercepted(agent: unknown, text: string, summary: string):
   queuePromptNotice(agent, text, summary)
 }
 
-/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
- *  opts.onAgent 在 agent 就绪后回调一次, 供 task_cancel 注册打断钩子;
- *  opts.fresh = true 且未传 sessionId 时强制全新会话(跳过池复用, 见 getAgent);
- *  opts.provider/model 为按次调用的模型覆盖(对新建/resume 会话生效);
- *  opts.mode 为按次的会话模式(解析后的 {preset?, sandbox?, approval?}): 指定即强制全新会话,
- *  创建时应用 —— 会话自创建起就跑在该模式下(避免后续再提权);
- *  opts.timeoutMs 为按次执行超时(覆盖全局 taskTimeoutMs; 0 = 不限制);
- *  opts.shouldAbort 在等锁后/执行前检查, 支持取消"排队/等锁中"的任务(agent 未就绪时 task_cancel 置 cancelled)。 */
-async function executeTask(
-  ctx: Context,
-  task: string,
-  context: string,
-  cwd: string,
-  resumeSessionId?: string,
-  title?: string,
-  opts?: {
-    onAgent?: (agent: Agent) => void
-    fresh?: boolean
-    provider?: string
-    model?: string
-    mode?: { preset?: string; sandbox?: string; approval?: string }
-    timeoutMs?: number
-    shouldAbort?: () => boolean
-  },
-): Promise<TaskResult> {
-  // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
-  // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
-  const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())
-  // cwd 白名单: 配置了 workspaceRoots 时, 只允许在列出的目录下干活(防路径穿越)
-  if (!cwdAllowed(workdir)) {
-    throw new Error(`cwd not allowed (outside workspaceRoots): ${workdir}`)
+// ── turn 事实源: session log 折叠 + 冷读持久化日志 ──
+// 「任务」的进度/结果不再由内存态 taskQueue 记录, 而是完全由 session log 推导:
+//   live 会话 → 读内存日志(并经 turnBoundaryProjection 校正 turn 边界)
+//   非 live(重启后/已退役) → 冷读持久化日志(官方 sessionPersistence 优先, zstd 落盘兜底), 因此重启不丢状态。
+
+/** 事件的最小只读视图(事件是宿主 live 数据, 只取需要的叶子字段, 不整体序列化) */
+interface EventView {
+  type?: string
+  seq?: number
+  data?: Record<string, unknown>
+}
+
+/** turn 状态折叠: session log 为唯一事实源, live 与冷读共用同一折叠(保证重启前后语义一致) */
+interface TurnState {
+  /** 末尾 turn/start 无对应 turn/end 时 = 在飞 turn(进程已不在 = interrupted); null = 无在飞 turn */
+  openTurn: { turn: number; startedSeq: number | null } | null
+  /** 最近一次**已闭合**的 turn(其 reason 即本轮结束原因) */
+  lastTurn: { turn: number; reason: { kind: string; error?: { code?: string; message?: string } } } | null
+  /** 最后一个 turn 边界内的 assistant 文本(供 parseSummary 提取 changes/verification/leftovers) */
+  lastTurnAssistantText: string
+  /** 最近一条 assistant 文本(不限 turn) */
+  lastText: string
+}
+
+/** 取一条消息事件的文本块(非文本块/空文本返回 '', 从根上消除 session_read 的 '(no text blocks)' 噪声)。
+ *  0.2 依据: SessionEventMap['user/message'] 的 data 就是 UserMessage 本体(content 直接在 data 上,
+ *  dsh-session lib/types/types.d.ts:294); 'assistant/message' 的 data 才是 {turn, step, message}(:330)。
+ *  两种形状都兼容, 旧宿主 user/message 的 {message, source} 形状也仍可读。 */
+function messageTextOf(event: unknown): string {
+  const d = (event as { data?: { content?: Array<{ type?: string; text?: string }>; message?: { content?: Array<{ type?: string; text?: string }> } } })?.data
+  const content = Array.isArray(d?.content) ? d.content : d?.message?.content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text !== '')
+    .map((c) => c.text as string)
+    .join('\n')
+}
+
+/** 折叠事件流 → turn 边界 + 最后一个 turn 内的 assistant 文本(单遍 O(n)) */
+function foldTurnState(events: readonly unknown[]): TurnState {
+  const state: TurnState = { openTurn: null, lastTurn: null, lastTurnAssistantText: '', lastText: '' }
+  let currentTurnText: string[] = []
+  let sawTurnStart = false
+  for (const raw of events) {
+    const e = raw as EventView
+    const type = e?.type
+    if (type === 'turn/start') {
+      const turn = Number((e.data as { turn?: unknown } | undefined)?.turn ?? 0)
+      state.openTurn = { turn, startedSeq: typeof e.seq === 'number' ? e.seq : null }
+      currentTurnText = []
+      sawTurnStart = true
+    } else if (type === 'turn/end') {
+      const d = e.data as { turn?: unknown; reason?: { kind?: unknown; error?: { code?: string; message?: string } } } | undefined
+      const turn = Number(d?.turn ?? state.openTurn?.turn ?? 0)
+      if (state.openTurn !== null && state.openTurn.turn === turn) state.openTurn = null
+      const error = d?.reason?.error
+      state.lastTurn = {
+        turn,
+        reason: {
+          kind: String(d?.reason?.kind ?? 'unknown'),
+          ...(error !== undefined && error !== null
+            ? { error: { ...(error.code !== undefined ? { code: error.code } : {}), ...(error.message !== undefined ? { message: error.message } : {}) } }
+            : {}),
+        },
+      }
+      state.lastTurnAssistantText = currentTurnText.join('\n')
+    } else if (type === 'assistant/message') {
+      const text = messageTextOf(e)
+      if (text) { currentTurnText.push(text); state.lastText = text }
+    }
   }
-  // sessionId 用 session 锁, 否则用 cwd 锁——都防同一 agent 会话被并发 followup
-  const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
-  return withLock(lockKey, async () => {
-    // 取消检查: 任务在等锁期间被 task_cancel(agent 未就绪路径)置了 cancelled → 执行前中止, 不启动 agent
-    if (opts?.shouldAbort?.()) throw new Error('task cancelled')
-    // 指定模式且未传 sessionId 时恒强制全新会话(池复用的存量会话无法安全套用新模式)
-    const modeRequested = opts?.mode !== undefined && (opts.mode.preset !== undefined || opts.mode.sandbox !== undefined || opts.mode.approval !== undefined)
-    // 会话命名: 显式 title 优先; 未传时按任务内容派生可读名称(只在新建会话时经 rename 落为 session/title 事件)
-    const effectiveTitle = title ?? deriveSessionTitle(task || context)
-    const { sessionId, handle, disposeAfter } = await getAgent(
-      ctx, workdir, resumeSessionId, effectiveTitle, opts?.fresh || (modeRequested && resumeSessionId === undefined),
-      { provider: opts?.provider, model: opts?.model }, opts?.mode,
-    )
-    // 标记「该会话当前有 MCP 任务在跑」(审批接管判据): 任务结束(成功/超时/取消/异常统一汇聚到
-    // return result 前的落点)立即清除, 避免残留导致后续 web UI 直发消息触发的审批被误接管。
-    mcpBusySessionIds.add(String(sessionId))
-    const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
+  // 尚未闭合的在飞 turn: 其部分文本也算「最后一个 turn 边界内」(调用方据 phase 判断是否已落定)
+  if (sawTurnStart && state.openTurn !== null) state.lastTurnAssistantText = currentTurnText.join('\n')
+  return state
+}
 
-    // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
-    const fullTask = [
-      context ? `【记忆/上下文(供参考, 来自 Hermes 大脑)】\n${context}\n` : '',
-      `【任务】\n${task}\n`,
-      `【完成后必须】用一行 JSON 总结(不要 markdown 代码块包裹, 直接输出这一行):`,
-      `{"changes":"改了什么","verification":"怎么验证的","leftovers":"遗留问题"}`,
-    ].filter(Boolean).join('\n')
+/** 宿主 turnBoundaryProjection 的只读视图(agent-loop 注册; 服务缺失时 undefined) */
+interface TurnBoundaryView {
+  openTurnStartSeq?: number | null
+  lastTurn?: number
+}
 
-    // 结构化读输出(提前声明, 供执行异常兜底填充)
-    const result: TaskResult = {
-      taskId: '', sessionId, assistantText: '', toolCalls: [], toolResults: [],
-      changes: '', verification: '', leftovers: '',
-    }
-    // 会话标题带回结果: 以 sessionTitle 服务快照为准(新建会话已由 rename 落事件; 复用会话读既有标题)
+/** 取宿主投影里的 turn 边界事实(权威; 日志被尾部窗口截断时用它补齐 openTurn) */
+function turnBoundaryOf(ctx: Context, session: unknown): TurnBoundaryView | undefined {
+  try {
+    const sp = ctx.get('sessionProjections') as { stateOf?: (s: unknown, key: string) => unknown } | undefined
+    const state = sp?.stateOf?.(session, 'turnBoundary')
+    return state === undefined || state === null ? undefined : (state as TurnBoundaryView)
+  } catch {
+    return undefined
+  }
+}
+
+/** live 会话的 turn 状态: 日志折叠为主, turnBoundaryProjection 校正(投影说在飞但窗口里看不到 start 时补齐) */
+function liveTurnState(ctx: Context, session: unknown): TurnState {
+  const state = foldTurnState(sessionEventsOf(session)) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
+  const boundary = turnBoundaryOf(ctx, session)
+  if (boundary !== undefined && boundary.openTurnStartSeq !== null && boundary.openTurnStartSeq !== undefined) {
+    state.openTurn = state.openTurn ?? { turn: boundary.lastTurn ?? 0, startedSeq: boundary.openTurnStartSeq }
+  }
+  return state
+}
+
+// ── 冷读: 非 live 会话从持久化日志推导 turn 状态(重启不丢) ──
+
+/** zstd CLI(child_process; 落盘兜底解压用) */
+const execFileAsync = promisify(execFile)
+
+/** DSH_HOME(默认 ~/.dsh) */
+function dshHome(): string {
+  return process.env.DSH_HOME ?? join(homedir(), '.dsh')
+}
+
+/** 持久化 read 句柄的只读视图(官方 API; 鸭子类型, 避免硬依赖内部类型) */
+interface ColdHandle {
+  header?: { cwd?: string; agentPreset?: string; createdAt?: number }
+  read(offset?: number, length?: number): Promise<{ events: readonly unknown[] }>
+  close(): Promise<void>
+}
+
+/** ctx.sessionPersistence 的只读视图(鸭子类型)。
+ *  0.2 依据: list(): Promise<readonly SessionPersistenceSnapshot[]>, 行是
+ *  { header: SessionHeader; revision; eventCount?; sizeBytes? } —— id/cwd/agentPreset 都在 row.header 上
+ *  (dsh-session-persistence lib/types/index.d.ts:14-30)。 */
+interface PersistenceView {
+  stat?: (id: unknown, options?: unknown) => Promise<{ eventCount?: number } | undefined>
+  open?: (id: unknown, access: 'read', options?: unknown) => Promise<ColdHandle>
+  list?: (options?: unknown) => Promise<readonly unknown[]>
+}
+
+/** 0.2 的 list() 行 → header(id/cwd/agentPreset 在 row.header 上); 旧宿主 id 直接在行上, 兜底兼容 */
+function persistedRowHeaderOf(row: unknown): { id?: unknown; cwd?: string; agentPreset?: string } {
+  const r = row as { header?: { id?: unknown; cwd?: string; agentPreset?: string } }
+  return r.header ?? (row as { id?: unknown; cwd?: string; agentPreset?: string })
+}
+
+/** 冷读结果 */
+interface ColdLog {
+  /** 事件窗口(可能是尾部切片; windowStart > 0 时非全量) */
+  events: unknown[]
+  /** 日志总事件数 */
+  total: number
+  /** 本次读取覆盖的起始 seq(>0 表示只读了尾部窗口) */
+  windowStart: number
+  source: 'persistence' | 'file'
+  path?: string
+  header?: { cwd?: string; agentPreset?: string; createdAt?: number }
+}
+
+/** 窗口内是否已包含一个完整的 turn 边界(最后一段 turn 可判定) */
+function windowHasTurnBoundary(events: readonly unknown[]): boolean {
+  let lastStart = -1
+  let lastEnd = -1
+  for (let i = 0; i < events.length; i++) {
+    const t = (events[i] as EventView)?.type
+    if (t === 'turn/start') lastStart = i
+    else if (t === 'turn/end') lastEnd = i
+  }
+  if (lastStart < 0) return false
+  if (lastEnd > lastStart) return true
+  return (events[0] as EventView | undefined)?.type === 'turn/start'
+}
+
+/**
+ * 冷读一个非 live 会话的事件流(尾部窗口):
+ *  ① 官方 ctx.sessionPersistence.open(id, 'read') —— 校验过的连续事件前缀, 跨进程安全, 与格式版本无关;
+ *  ② 兜底: 直接解压 ~/.dsh/sessions/<项目键>/<sessionId>/session.vN.jsonl.zstd(zstd CLI)——
+ *     官方读句柄不可用时仍能拿到事实(撕裂尾行由 JSON.parse 逐行容错跳过)。
+ *
+ * 注(实测 dsh 0.2.0-rc.1 + dsh-session-persistence-jsonl): stat() 不提供 eventCount, 拿不到总长时
+ * 退化走 read(0) 全量读 + 尾部切片; 后端若提供 eventCount 则直接按窗口 seek(少读很多)。两者结果一致。
+ */
+async function readColdLog(ctx: Context, sessionId: string, minEvents: number): Promise<ColdLog | undefined> {
+  const CHUNK = 2000
+  const MAX = 30000
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  if (persistence?.open) {
+    let handle: ColdHandle | undefined
     try {
-      const currentTitle = sessionTitleOf(ctx, handle.agent.session)
-      if (currentTitle !== undefined) result.title = currentTitle
+      handle = await persistence.open(SessionId(sessionId), 'read')
     } catch {
-      /* 标题读取失败不阻断结果返回 */
+      handle = undefined // 持久化里没有该会话(或读取被拒) → 落盘兜底
     }
-
-    // 驱动 agent 执行; 执行/调度层抛出的异常(非超时)转成结构化 error 结果, 不再上抛导致空跑
-    try {
-      handle.agent.followup(
-        createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
-      )
-      // agent 就绪: 通知调用方(供 task_cancel 注册打断钩子)
-      opts?.onAgent?.(handle.agent)
-
-      // 超时保护: whenIdle 无限等待会让 MCP 客户端挂死; 到点后 cancel 打断本轮, 回收部分输出
-      // (per-task timeoutMs 覆盖全局 taskTimeoutMs)
-      const taskTimeout = opts?.timeoutMs ?? runtimeConfig.taskTimeoutMs
-      let timedOut = false
-      let timer: ReturnType<typeof setTimeout> | undefined
+    if (handle !== undefined) {
       try {
-        await Promise.race([
-          handle.agent.whenIdle(),
-          new Promise<never>((_resolve, reject) => {
-            if (taskTimeout > 0) {
-              timer = setTimeout(() => { timedOut = true; reject(TASK_TIMEOUT) }, taskTimeout)
-            }
-          }),
-        ])
+        let total: number | undefined
+        try { total = (await persistence.stat?.(SessionId(sessionId)))?.eventCount } catch { /* 元数据缺失: 退化为全量读 */ }
+        let events: readonly unknown[] = []
+        let windowStart = 0
+        if (typeof total === 'number' && total > 0) {
+          let take = Math.max(CHUNK, Math.min(minEvents, MAX))
+          for (;;) {
+            windowStart = Math.max(0, total - take)
+            events = (await handle.read(windowStart, total - windowStart)).events
+            if (windowStart === 0 || events.length >= MAX) break
+            if (events.length >= minEvents && windowHasTurnBoundary(events)) break
+            if (take >= MAX) break
+            take = Math.min(MAX, take * 2)
+          }
+        } else {
+          events = (await handle.read(0)).events
+          windowStart = 0
+          total = events.length
+        }
+        return {
+          events: [...events],
+          total: typeof total === 'number' ? total : events.length,
+          windowStart,
+          source: 'persistence',
+          ...(handle.header !== undefined ? { header: handle.header } : {}),
+        }
       } catch (e) {
-        if (e !== TASK_TIMEOUT) throw e
-        // cancel 丢弃未开始的排队输入, 中止活动回合; 之后 whenIdle 很快落定
-        try { handle.agent.cancel({ kind: 'hook', reason: 'harness-mcp-timeout' }) } catch { /* 打断失败不阻断回收 */ }
-        await handle.agent.whenIdle()
-        result.timeout = true
+        console.warn('[harness-mcp-server] persisted log read via sessionPersistence failed, falling back to disk:', (e as Error)?.message ?? e)
       } finally {
-        if (timer !== undefined) clearTimeout(timer)
+        try { await handle.close() } catch { /* ignore */ }
+      }
+    }
+  }
+  return readColdLogFromDisk(sessionId, MAX)
+}
+
+/** 落盘兜底: 扫 ~/.dsh/sessions/<项目键>/<sessionId>/ 下的 session.vN.jsonl(.zstd) 并解出事件 */
+async function readColdLogFromDisk(sessionId: string, maxEvents: number): Promise<ColdLog | undefined> {
+  const root = join(dshHome(), 'sessions')
+  let projects: string[]
+  try { projects = await readdir(root) } catch { return undefined }
+  for (const project of projects) {
+    const dir = join(root, project, sessionId)
+    let files: string[]
+    try { files = await readdir(dir) } catch { continue } // 该会话不在这个项目目录下
+    const logs = files.filter((f) => /^session(\.v\d+)?\.jsonl(\.zstd)?$/.test(f)).sort()
+    const name = logs[logs.length - 1]
+    if (name === undefined) continue
+    const path = join(dir, name)
+    let text: string
+    try {
+      if (name.endsWith('.zstd')) {
+        const { stdout } = await execFileAsync('zstd', ['-dc', '--', path], { maxBuffer: 512 * 1024 * 1024 })
+        text = stdout
+      } else {
+        text = await readFile(path, 'utf8')
       }
     } catch (e) {
-      // 【1c】agent 执行/调度层异常(如 agent-loop 抛错): 转成结构化 error 结果, 任务以 status=error 结束
-      const err = e as { code?: string; message?: string; name?: string }
-      result.error = {
-        errorCode: err?.code ?? 'AGENT_ERROR',
-        errorMessage: err?.message ?? String(e),
-        errorCategory: 'execution',
-      }
+      console.warn('[harness-mcp-server] cold log read failed:', path, (e as Error)?.message ?? e)
+      continue
     }
-
-    // 结构化读输出
-    try {
-      const log = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).slice(baseline)
-      for (const e of log) {
-        const ev = e as {
-          type?: string
-          message?: { content?: { type?: string; text?: string }[] }
-          data?: unknown
-        }
-        if (ev.type === 'assistant/message') {
-          const d = ev.data as { message?: { content?: { type?: string; text?: string }[] } } | undefined
-          const content = d?.message?.content
-          if (content) {
-            const texts = content.filter((c) => c.type === 'text' && c.text).map((c) => c.text)
-            if (texts.length) result.assistantText += texts.join('\n') + '\n'
-          }
-        } else if (ev.type === 'tool/call') {
-          const d = ev.data as { name?: string; arguments?: string; input?: unknown } | undefined
-          result.toolCalls.push({
-            name: d?.name ?? '?',
-            args: (d?.arguments ?? JSON.stringify(d?.input ?? null) ?? '').slice(0, 2000),
-          })
-        } else if (ev.type === 'tool/result') {
-          const texts: string[] = []
-          extractText(ev.data ?? ev, texts)
-          if (texts.length) result.toolResults.push(texts.join('\n').slice(0, 3000))
-        }
-      }
-      // 【1b】模型/执行失败感知: turn/end reason.kind ∈ {error, failed, max-tokens} → 结构化错误。
-      // 真实模型接口报错(配额/网络/参数)以 reason.kind='error' 出现(实测 429 QUOTA 会话),
-      // 'max-tokens' 为输出上限(模型侧限制); LLM 错误码原样保留, 'UNKNOWN' 视为通用执行失败。
-      for (const e of log) {
-        const ev = e as {
-          type?: string
-          data?: { reason?: { kind?: string; error?: { code?: string; message?: string } }; chunk?: { type?: string; reason?: { kind?: string; failure?: { code?: string; message?: string } } } }
-        }
-        const reason = ev.data?.reason
-        if (ev.type === 'turn/end' && reason !== undefined && (reason.kind === 'error' || reason.kind === 'failed' || reason.kind === 'max-tokens')) {
-          const err = (reason.kind === 'error' || reason.kind === 'failed') ? reason.error : undefined
-          const code = err?.code ?? (reason.kind === 'max-tokens' ? 'MAX_TOKENS' : 'UNKNOWN')
-          result.error = {
-            errorCode: code,
-            errorMessage: err?.message ?? (reason.kind === 'max-tokens' ? 'output token ceiling reached' : 'agent turn failed'),
-            errorCategory: code === 'UNKNOWN' ? 'execution' : 'model',
-          }
-          break
-        }
-        // 兜底: assistant/chunk finish 报错(未及 turn/end 时)
-        if (ev.type === 'assistant/chunk' && ev.data?.chunk?.type === 'finish' && ev.data.chunk.reason?.kind === 'error' && ev.data.chunk.reason.failure) {
-          result.error = {
-            errorCode: ev.data.chunk.reason.failure.code ?? 'MODEL_ERROR',
-            errorMessage: ev.data.chunk.reason.failure.message ?? 'model request failed',
-            errorCategory: 'model',
-          }
-          break
-        }
-      }
-    } catch (e) {
-      result.assistantText = `[读输出异常] ${String(e)}`
-    }
-
-    // 解析结构化 summary
-    const summary = parseSummary(result.assistantText)
-    result.changes = summary.changes
-    result.verification = summary.verification
-    result.leftovers = summary.leftovers
-
-    // C3 兜底: 模型没按格式吐 JSON 时, 用最近工具结果摘要填充 changes(尽力而为, 不再全空)
-    if (!result.changes && !result.verification && !result.leftovers) {
-      const last = result.toolResults.slice(-5).join('\n').slice(0, 1500)
-      if (last) result.changes = `(heuristic from tool output) ${last}`
-    }
-
-    // 超时标注: leftovers 为空时补一句引导, 提示可用 sessionId 续接
-    if (result.timeout === true && !result.leftovers) {
-      result.leftovers = '任务超时被自动取消, 以上为部分进展; 可用 sessionId 续接继续'
-    }
-
-    // 上下文占用快照: 任务结束瞬间(agent 仍 live)测量, 挂到 result 供调用方跟踪占用;
-    // tokenMeter 缺失返回 null, 窗口不可解析时 window/ratio 为 null(不阻断结果返回)
-    try {
-      result.context = await contextUsage(ctx, handle.agent.session, handle.agent)
-    } catch {
-      result.context = null
-    }
-
-    // 模式快照: 任务所用会话的生效模式(preset + 沙箱 + 审批); 本任务请求的模式已应用时 requested 与 effective 一致
-    try {
-      const sidStr = String(sessionId)
-      const eff = sessionModeOf(ctx, sidStr, handle.agent.session, (handle.agent.session as { header?: { agentPreset?: string } }).header)
-      result.mode = {
-        preset: eff.preset,
-        sandbox: eff.sandbox,
-        approval: eff.approval,
-        ...(eff.permissionPreset !== undefined ? { permissionPreset: eff.permissionPreset } : {}),
-        ...(opts?.mode !== undefined && (opts.mode.preset !== undefined || opts.mode.sandbox !== undefined || opts.mode.approval !== undefined)
-          ? { requested: { ...(opts.mode.preset !== undefined ? { preset: opts.mode.preset } : {}), ...(opts.mode.sandbox !== undefined ? { sandbox: opts.mode.sandbox } : {}), ...(opts.mode.approval !== undefined ? { approval: opts.mode.approval } : {}) } }
-          : {}),
-      }
-    } catch {
-      /* 模式快照失败不阻断结果返回 */
-    }
-
-    // resume 兜底分支: 尽力 flush 持久化, 再释放我们 resume 出来的句柄(不留给僵尸 live agent)
-    if (disposeAfter) {
+    const all: unknown[] = []
+    let header: ColdLog['header']
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
       try {
-        await (ctx.get('sessions') as { flush?: (session: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
-      } catch {
-        /* flush 失败不阻断结果返回 */
-      }
-      try {
-        await handle.dispose()
-      } catch {
-        /* 释放失败不影响结果 */
+        const row = JSON.parse(trimmed) as { type?: string; cwd?: string; agentPreset?: string; createdAt?: number }
+        if (row.type === 'session') {
+          header = {
+            ...(row.cwd !== undefined ? { cwd: row.cwd } : {}),
+            ...(row.agentPreset !== undefined ? { agentPreset: row.agentPreset } : {}),
+            ...(row.createdAt !== undefined ? { createdAt: row.createdAt } : {}),
+          }
+          continue
+        }
+        all.push(row)
+      } catch { /* 撕裂尾行/非法行: 跳过 */ }
+    }
+    const windowStart = Math.max(0, all.length - maxEvents)
+    return {
+      events: all.slice(windowStart),
+      total: all.length,
+      windowStart,
+      source: 'file',
+      path,
+      ...(header !== undefined ? { header } : {}),
+    }
+  }
+  return undefined
+}
+
+/** 非 live 会话的 header(cwd/preset): 冷读日志头部优先已有, 这里补持久化 list 兜底 */
+async function persistedHeaderOf(ctx: Context, sessionId: string): Promise<{ cwd?: string; agentPreset?: string } | undefined> {
+  try {
+    const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+    for (const row of (await persistence?.list?.()) ?? []) {
+      // 0.2: list() 行是 { header, revision, ... }, id/cwd/agentPreset 在 row.header 上
+      const h = persistedRowHeaderOf(row)
+      if (String(h.id) === sessionId) {
+        return { ...(h.cwd !== undefined ? { cwd: h.cwd } : {}), ...(h.agentPreset !== undefined ? { agentPreset: h.agentPreset } : {}) }
       }
     }
+  } catch { /* ignore */ }
+  return undefined
+}
 
-    // 任务结束统一落点(正常/超时/取消/错误都汇聚到这里): 不论成功/超时/取消/异常都清除
-    // 「MCP 任务在跑」标记 —— 残留会让审批应答者误以为仍有 MCP 活跃任务而错误接管。
-    mcpBusySessionIds.delete(String(sessionId))
+/** 订阅某会话的已提交事件(只读叶子字段, 不搬运 live 对象); 宿主事件不可用时返回 undefined */
+function onSessionEvent(ctx: Context, sessionId: string, listener: (event: unknown) => void): (() => void) | undefined {
+  try {
+    const on = ctx.on as unknown as (name: string, fn: (session: unknown, event: unknown) => void) => unknown
+    const disposer = on.call(ctx, 'session/event', (session: unknown, event: unknown) => {
+      if (String((session as { id?: unknown } | undefined)?.id) !== sessionId) return
+      listener(event)
+    })
+    return typeof disposer === 'function' ? (disposer as () => void) : undefined
+  } catch (e) {
+    console.warn('[harness-mcp-server] session/event subscription unavailable:', (e as Error)?.message ?? String(e))
+    return undefined
+  }
+}
 
-    return result
+// ── 派活: 任务文本组装 + 投喂后登记 ──
+
+/** 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求(照搬旧 executeTask 的模板) */
+function composeTaskMessage(context: string, task: string): string {
+  return [
+    context ? `【记忆/上下文(供参考, 来自 Hermes 大脑)】\n${context}\n` : '',
+    `【任务】\n${task}\n`,
+    `【完成后必须】用一行 JSON 总结(不要 markdown 代码块包裹, 直接输出这一行):`,
+    `{"changes":"改了什么","verification":"怎么验证的","leftovers":"遗留问题"}`,
+  ].filter(Boolean).join('\n')
+}
+
+/** 临时 resume 句柄的释放上限(观测不到 turn/end 时的兜底, 防句柄泄漏) */
+const DETACHED_RELEASE_MAX_MS = 60 * 60 * 1000
+
+/**
+ * 非驻池 resume 句柄的释放登记: 该会话「本轮 turn/end」落定时 flush + dispose(与旧 executeTask 的
+ * disposeAfter 语义对齐 —— 区别只在于**投喂方不再持有等待**, 释放改由事件驱动)。
+ *
+ * ⚠️ 必须在 agent.followup() **之前**调用: 真实 agent-loop 的 followup 只是入队+唤醒, turn/start 通常
+ * 晚于本次调用才落日志; 但宿主实现完全可能同步开 turn —— 那时若在 followup 之后才挂观测器, 就永远看不到
+ * 那个 turn/start。因此这里对 turn/end 的判据是「本观测器记到的那个 turn」**或**「还没记到任何 turn/start
+ * 时的第一次 turn/end」(resume 出来的会话此刻必空闲, 在飞 turn 只可能是本轮投喂的)。
+ * 找不到 turn/end(事件丢失)时由 DETACHED_RELEASE_MAX_MS 兜底, 防句柄泄漏。
+ *
+ * @returns finish —— 立即 flush+dispose 的幂等函数(投喂失败路径直接调用, 不留悬挂观测器)
+ */
+function releaseAfterTurn(ctx: Context, sessionId: string, handle: AgentHandle): () => Promise<void> {
+  let done = false
+  let ourTurn: number | null = null
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let pending: Promise<void> = Promise.resolve()
+  const finish = (): Promise<void> => {
+    if (done) return pending
+    done = true
+    if (timer !== undefined) clearTimeout(timer)
+    off?.()
+    pending = (async () => {
+      try {
+        await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
+      } catch { /* flush 失败不阻断释放 */ }
+      try { await handle.dispose() } catch { /* 释放失败不影响调用方 */ }
+    })()
+    return pending
+  }
+  const off = onSessionEvent(ctx, sessionId, (event) => {
+    const e = event as EventView
+    if (e.type === 'turn/start') {
+      if (ourTurn === null) ourTurn = Number((e.data as { turn?: unknown } | undefined)?.turn ?? 0)
+    } else if (e.type === 'turn/end') {
+      const turn = Number((e.data as { turn?: unknown } | undefined)?.turn ?? -1)
+      if (ourTurn === null || turn === ourTurn) void finish()
+    }
+  })
+  timer = setTimeout(() => void finish(), DETACHED_RELEASE_MAX_MS)
+  if (typeof timer === 'object' && timer !== null) (timer as { unref?: () => void }).unref?.()
+  return finish
+}
+
+// ── 主动查询: session_status 组装(供 session_status / session_wait 共用) ──
+
+/** session_status 的返回体(也是 session_wait 的 status 字段) */
+interface SessionStatusBody {
+  sessionId: string
+  live: boolean
+  source: 'live' | 'persisted'
+  cwd?: string
+  title?: string
+  agentStatus?: string
+  phase: 'idle' | 'running' | 'waiting_input' | 'interrupted'
+  openTurn: { turn: number; startedSeq: number | null } | null
+  lastTurn: TurnState['lastTurn']
+  prompts: PromptRow[]
+  context: ContextUsage | null
+  logEvents: number
+  changes: string | null
+  verification: string | null
+  leftovers: string | null
+  lastText: string
+  note?: string
+}
+
+/** 组装会话状态: live 直读内存日志; 非 live 冷读持久化日志(末尾 turn/start 无 turn/end = interrupted) */
+async function buildSessionStatus(ctx: Context, sessionId: string): Promise<SessionStatusBody | undefined> {
+  const agent = liveAgentFor(ctx, sessionId) as Agent | undefined
+  const session = agent?.session as unknown
+  let state: TurnState
+  let prompts: PromptRow[]
+  let context: ContextUsage | null
+  let logEvents: number
+  let source: 'live' | 'persisted'
+  let cwd: string | undefined
+  let title: string | undefined
+  let note: string | undefined
+
+  if (agent !== undefined && session !== undefined) {
+    const log = sessionEventsOf(session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
+    state = liveTurnState(ctx, session)
+    prompts = promptsFor(sessionId, session)
+    logEvents = log.length
+    source = 'live'
+    cwd = (session as { header?: { cwd?: string } }).header?.cwd
+    title = sessionTitleOf(ctx, session)
+    context = await contextUsage(ctx, session, agent)
+  } else {
+    const cold = await readColdLog(ctx, sessionId, 200)
+    if (cold === undefined) return undefined
+    state = foldTurnState(cold.events)
+    prompts = promptsFor(sessionId, undefined)
+    logEvents = cold.total
+    source = 'persisted'
+    const header = cold.header ?? await persistedHeaderOf(ctx, sessionId)
+    cwd = header?.cwd
+    note = cold.windowStart > 0
+      ? `cold read from the persisted session log (tail window: seq ${cold.windowStart}..${cold.total - 1} of ${cold.total}, source=${cold.source})`
+      : `cold read from the persisted session log (source=${cold.source}); the process that owned this session is gone, so nothing is running — an unbalanced tail turn/start is reported as interrupted`
+    // 非 live 没有 Session 对象可供 tokenMeter 计量(挂起弹窗也随进程消失), context 恒 null
+    context = null
+  }
+
+  const phase: SessionStatusBody['phase'] = source === 'live'
+    ? (prompts.length > 0 ? 'waiting_input' : (state.openTurn !== null || agent?.status === 'running' ? 'running' : 'idle'))
+    : (state.openTurn !== null ? 'interrupted' : 'idle')
+
+  const summary = state.lastTurnAssistantText ? parseSummary(state.lastTurnAssistantText) : { changes: '', verification: '', leftovers: '' }
+  const hasSummary = summary.changes !== '' || summary.verification !== '' || summary.leftovers !== ''
+  return {
+    sessionId,
+    live: source === 'live',
+    source,
+    ...(cwd !== undefined ? { cwd } : {}),
+    ...(title !== undefined ? { title } : {}),
+    ...(source === 'live' && agent?.status !== undefined ? { agentStatus: agent.status } : {}),
+    phase,
+    openTurn: state.openTurn,
+    lastTurn: state.lastTurn,
+    prompts,
+    context,
+    logEvents,
+    changes: hasSummary ? summary.changes : null,
+    verification: hasSummary ? summary.verification : null,
+    leftovers: hasSummary ? summary.leftovers : null,
+    lastText: state.lastText,
+    ...(note !== undefined ? { note } : {}),
+  }
+}
+
+/** session_wait 单段等待上限(MCP 客户端 HTTP 超时通常更短, 这里给足但封顶) */
+const MAX_WAIT_MS = 240000
+
+/** 等会话落定(事件驱动 + 500ms 兜底轮询): true = 目标已达成, false = 超时 */
+function waitForSettle(
+  ctx: Context,
+  sessionId: string,
+  agent: Agent,
+  until: 'turn-end' | 'idle' | 'input',
+  capMs: number,
+  minTurn: number,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false
+    let off: (() => void) | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let interval: ReturnType<typeof setInterval> | undefined
+    const finish = (settled: boolean): void => {
+      if (done) return
+      done = true
+      if (timer !== undefined) clearTimeout(timer)
+      if (interval !== undefined) clearInterval(interval)
+      off?.()
+      resolve(settled)
+    }
+    const check = (): void => {
+      if (done) return
+      const state = liveTurnState(ctx, agent.session)
+      const prompts = promptsFor(sessionId, agent.session)
+      if (until === 'input') { if (prompts.length > 0) finish(true); return }
+      if (until === 'idle') {
+        if (state.openTurn === null && prompts.length === 0 && (agent.status ?? 'idle') === 'idle') finish(true)
+        return
+      }
+      if (state.openTurn === null && state.lastTurn !== null && state.lastTurn.turn >= minTurn) finish(true)
+    }
+    off = onSessionEvent(ctx, sessionId, () => check())
+    interval = setInterval(check, 500)
+    if (typeof interval === 'object' && interval !== null) (interval as { unref?: () => void }).unref?.()
+    timer = setTimeout(() => finish(false), capMs)
+    if (typeof timer === 'object' && timer !== null) (timer as { unref?: () => void }).unref?.()
+    check()
   })
 }
-
-/** 异步任务队列(进程内存, 骨架阶段; 后续可持久化) */
-interface TaskItem {
-  id: string
-  task: string
-  context: string
-  cwd: string
-  sessionId?: string
-  title?: string
-  /** true = 执行时强制全新会话(不池复用) */
-  newSession?: boolean
-  /** 按次调用的模型/provider 覆盖 */
-  model?: string
-  provider?: string
-  /** 按次的会话模式(解析后的 {preset?, sandbox?, approval?}): 创建会话时应用 */
-  mode?: { preset?: string; sandbox?: string; approval?: string }
-  /** 按次执行超时(覆盖全局 taskTimeoutMs; 0 = 不限制) */
-  timeoutMs?: number
-  /** agent 就绪时的会话日志起点(供进度提取本任务增量) */
-  baseline?: number
-  status: 'queued' | 'running' | 'done' | 'error'
-  result?: TaskResult
-  error?: string
-  /** 任务结束时所用会话的上下文占用快照(agent 已退役后 task_result/task_list 仍可读) */
-  contextUsage?: ContextUsage | null
-  /** true = 被 task_cancel 主动打断(区别于超时自动 cancel) */
-  cancelled?: boolean
-  createdAt: number
-  finishedAt?: number
-}
-const taskQueue = new Map<string, TaskItem>()
-
-/** taskId → 打断钩子: 任务进入 running 且 agent 就绪后注册, task_cancel 调用后清理 */
-const taskCancelHooks = new Map<string, () => Promise<void>>()
 
 /** 找会话 header: live 优先, 其次持久化 list(轻量元数据扫描, 不加载整日志) */
 async function findSessionHeader(ctx: Context, sessionId: SessionId): Promise<SessionHeader | undefined> {
   const sessions = ctx.get('sessions') as { get?: (id: SessionId) => { header: SessionHeader } | undefined } | undefined
   const live = sessions?.get?.(sessionId)
   if (live !== undefined) return live.header
-  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<SessionHeader[]> } | undefined
-  for (const header of (await persistence?.list?.()) ?? []) {
-    if (header.id === sessionId) return header
+  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
+  for (const row of (await persistence?.list?.()) ?? []) {
+    // 0.2: list() 行是 { header, revision, ... }, id 在 row.header 上
+    const header = persistedRowHeaderOf(row)
+    if (header.id === sessionId) return header as SessionHeader
   }
   return undefined
 }
@@ -1458,8 +1680,10 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   const headers = new Map<string, SessionHeader>()
   const sessions = ctx.get('sessions') as { list?: () => { header: SessionHeader }[] } | undefined
   for (const session of sessions?.list?.() ?? []) headers.set(session.header.id, session.header)
-  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<SessionHeader[]> } | undefined
-  for (const header of (await persistence?.list?.()) ?? []) {
+  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
+  for (const row of (await persistence?.list?.()) ?? []) {
+    // 0.2: list() 行是 { header, revision, ... }, id/cwd 在 row.header 上
+    const header = persistedRowHeaderOf(row) as SessionHeader
     if (!headers.has(header.id)) headers.set(header.id, header)
   }
 
@@ -1490,37 +1714,31 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   })
 
   mcp.tool('harness_list_tools', '列出 Harness 当前注册的所有工具名', {}, async () => {
-    const tools = ctx.tools as unknown as { keys?: () => Iterable<string> } | null
-    const names = tools && typeof tools.keys === 'function' ? Array.from(tools.keys()) : []
+    // 0.2 依据: tools 服务没有 keys(), 只有 get/schemas/register/restrict/guard;
+    // schemas(scope?) 返回 ToolSchema[], name 在 schema 上(dsh-tools lib/types/index.d.ts, dsh-llm types.d.ts:462)
+    const tools = ctx.tools as unknown as { schemas?: () => Array<{ name?: string }> } | null
+    const names = (tools?.schemas?.() ?? []).map((s) => s.name ?? '').filter((n) => n !== '')
     return out(JSON.stringify(names))
   })
 
-  // 运维总览: 队列/agent 池/live 会话/运行时配置 —— 外部客户端一眼看清系统水位
+  // 运维总览: agent 池/live 会话/运行时配置 —— 外部客户端一眼看清系统水位(任务层已降维为 session+turn)
   mcp.tool(
     'harness_status',
-    '系统水位总览: 任务队列(排队/执行/完成/失败)、agent 常驻池、live 会话数、运行时配置。',
+    '系统水位总览: agent 常驻池、live 会话数、MCP 在飞 turn(按会话)、运行时配置。',
     {},
     async () => {
-      let queued = 0, running = 0, done = 0, error = 0
-      for (const t of taskQueue.values()) {
-        if (t.status === 'queued') queued++
-        else if (t.status === 'running') running++
-        else if (t.status === 'error') error++
-        else done++
-      }
       const liveCount = ((ctx.agents as unknown as { list?: () => unknown[] }).list?.() ?? []).length
+      const inFlight = [...mcpPendingTurns.entries()].map(([sessionId, turns]) => ({ sessionId, turns }))
       return out(JSON.stringify({
         uptimeSec: Math.round(process.uptime()),
-        queue: { total: taskQueue.size, queued, running, done, error },
         agentPool: { size: liveAgents.size, max: runtimeConfig.maxAgents, liveAgents: liveCount },
+        mcpInFlightTurns: { sessions: inFlight.length, total: inFlight.reduce((n, r) => n + r.turns, 0), detail: inFlight },
         config: {
           provider: runtimeConfig.provider,
           model: runtimeConfig.model || '(dsh default)',
           preset: runtimeConfig.preset,
-          maxQueue: runtimeConfig.maxQueue,
           maxAgents: runtimeConfig.maxAgents,
           taskTimeoutMs: runtimeConfig.taskTimeoutMs,
-          taskTtlMs: runtimeConfig.taskTtlMs,
         },
       }, null, 2))
     },
@@ -1582,14 +1800,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
-  // 模式目录: 会话「模式」= agent preset(standard/code/cordis 等) + 沙箱访问模式(read-only/workspace-write/
+  // preset 目录: DSH 的会话术语是 **agent preset**(会话预设, standard/code/cordis/minimal 等, 来自 dsh
+  // agent-presets), 它是主词; 与「预设定向」相关的其余维度并列列出 —— 沙箱访问模式(read-only/workspace-write/
   // danger-full-access) + 审批策略(ask/never) + 权限预设(捆绑沙箱+审批, 如 workspace-write = workspace-write+ask)。
-  // modes 汇总给出可传给 agent_run/task_inbox 的 mode= 规范 id(按类别), 与 model_list 的枚举姿势一致:
+  // modes 汇总给出可传给 session_send 的 mode= 规范 id(按类别), 与 model_list 的枚举姿势一致:
   // presets 经 ctx.agentPresets.list() 实时枚举, 沙箱/审批词汇固定, 默认值经 ctx.sandboxPolicy / ctx.approval /
   // ctx.permissionPresets(服务缺省时给安全回退)。withDetail=true 附带更多元数据与部署默认。
   mcp.tool(
-    'mode_list',
-    '列出可用会话模式: agent preset(standard/code/cordis/minimal 等, 来自 dsh agent-presets) + 沙箱访问模式(read-only/workspace-write/danger-full-access) + 审批策略(ask/never) + 权限预设(捆绑沙箱+审批, 如 workspace-write = workspace-write + ask)。modes 汇总给出可传给 agent_run/task_inbox 的 mode= 规范 id; 传 only 只列某一类。',
+    'preset_list',
+    '列出 agent preset(会话预设)目录: preset 本体(standard/code/cordis/minimal 等, 来自 dsh agent-presets, 主词), 以及预设定向的其余维度 —— 沙箱访问模式(read-only/workspace-write/danger-full-access) + 审批策略(ask/never) + 权限预设(捆绑沙箱+审批, 如 workspace-write = workspace-write + ask)。modes 汇总给出可传给 session_send 的 mode= 规范 id; 传 only 只列某一类(preset 为缺省关注点)。',
     {
       only: z.enum(['preset', 'sandbox', 'approval', 'permission']).optional().describe('只列出某一类(preset/sandbox/approval/permission); 缺省列全部'),
       withDetail: z.boolean().optional().describe('true = 附带详细字段(preset 路径/顺序/损坏原因, 部署默认, 每个 mode 的语义/适用场景)'),
@@ -1666,7 +1885,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }
       }
 
-      // 5) modes 汇总: 传给 agent_run/task_inbox mode= 的规范 id(按类别去重, 与类别行同序)
+      // 5) modes 汇总: 传给 session_send mode= 的规范 id(按类别去重, 与类别行同序)
       const modes: Record<string, unknown>[] = []
       const seen = new Set<string>()
       for (const p of permissionPresetsList) {
@@ -1748,7 +1967,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       }
       const agent = resolved.handle.agent
       try {
-        const log = ((agent.session as unknown as { log?: unknown[] }).log ?? [])
+        const log = sessionEventsOf(agent.session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
         // limit 按「表面事件」计: 真实 dsh 日志里 assistant/chunk、reasoning-chunks、step/* 等流式/内部事件
         // 占绝对多数且稀疏夹杂表面事件, 直接 slice 原始日志会让 limit 失效(最后 N 条原始日志常只含 1 条表面事件)。
         // 因此先收集表面事件下标, 再取最近 N 条格式化。
@@ -1766,9 +1985,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           const e = ev as { seq?: number; type?: string; data?: { message?: { content?: { type?: string; text?: string }[] }; name?: string; arguments?: string } }
           const type = e.type
           if (type === 'user/message' || type === 'assistant/message') {
-            const content = e.data?.message?.content
-            const text = (content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join('\n').slice(0, 4000)
-            events.push({ seq: e.seq, type, text: text || '(no text blocks)' })
+            // 0.2: user/message 的 data 就是 UserMessage(content 在 data 上); assistant/message 才是 {message} —— 统一经 messageTextOf 兼容两种形状
+            const text = messageTextOf(ev)
+            events.push({ seq: e.seq, type, text: text.slice(0, 4000) || '(no text blocks)' })
           } else if (type === 'tool/call') {
             events.push({ seq: e.seq, type, text: `${e.data?.name ?? '?'}(${String(e.data?.arguments ?? '').slice(0, 2000)})` })
           } else if (type === 'tool/result') {
@@ -1787,366 +2006,259 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
-  // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)。
-  // 不传 sessionId 时 cwd 必填(避免误用 dsh 进程目录); 传 timeoutMs 可把长任务转成异步(返回 taskId 供轮询/取消)。
+  // 【派活入口】把一个 turn 投喂进会话: resume-or-create agent → 组装 message → followup → **立即返回**。
+  // 不再有 taskId/任务队列/超时阻塞: 之后用 session_status 主动查询(session log 为唯一事实源),
+  // 或用 session_wait 可选阻塞一段, 或用 session_cancel 打断。
   mcp.tool(
-    'agent_run',
-    '同步执行任务(改代码/分析/跑命令), 返回结构化结果, 附任务会话上下文占用 context(events/tokens/pressure/window/ratio)与生效模式 mode(preset/sandbox/approval)。可传 sessionId 续接已有会话(长任务分多轮投喂); 可传 newSession:true 强制全新会话(不复用池); 可传 model/provider 按次选模型; 可传 preset/mode/sandbox/approval 指定会话模式(创建会话时应用, 指定即强制全新会话, 避免后续再提权); 传 timeoutMs(毫秒)超时后自动转为异步任务(返回 taskId, 用 task_result/task_cancel/task_wait 跟进)。',
+    'session_send',
+    '把一条任务作为一个 turn 投喂进会话并立即返回(不等待、不超时阻塞)。传 sessionId 续接已有会话, 或传 cwd 复用/创建该目录的常驻会话(newSession:true 强制全新会话)。消息模板 = 记忆上下文 + 【任务】 + 「完成后必须输出一行 summary JSON」。返回 {sessionId, inboxDepth, openTurn}; 之后用 session_status 查询 phase/lastTurn 与结构化结果(changes/verification/leftovers), 用 session_tail 拉过程明细, 用 session_cancel 打断。',
     {
-      task: z.string().describe('要 Harness 执行的自然语言任务'),
-      context: z.string().optional().describe('Hermes 记忆/上下文, 注入给 agent 参考'),
-      cwd: z.string().optional().describe('工作目录(不传 sessionId 时必填; 可用 workspace_list 查看可用目录)'),
-      sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
-      newSession: z.boolean().optional().describe('true = 强制全新会话(跳过该 cwd 的池复用, 旧会话退役但持久化保留, 仍可凭 sessionId 续接); 缺省 = 复用该 cwd 的常驻会话'),
-      model: z.string().optional().describe('本次任务使用的模型 id(对新建/resume 会话生效; 池复用的会话保持原模型)'),
-      provider: z.string().optional().describe('本次任务使用的 provider 路由(默认 deepseek-official)'),
-      mode: z.string().optional().describe('会话模式(创建新会话时应用; 指定即强制全新会话)。取值见 mode_list 的 modes: agent preset id(standard/code/cordis/minimal) 或权限预设名(如 workspace-write = 沙箱 workspace-write + 审批 ask) 或沙箱模式(read-only/workspace-write/danger-full-access) 或审批策略(ask/never)'),
-      preset: z.string().optional().describe('agent preset id(standard/code/cordis/minimal 等; 挂载到新会话, 写进 session header 的 agentPreset)。resume 存量会话时也允许(在 setup 挂载该 preset)'),
+      sessionId: z.string().optional().describe('续接已有会话的 sessionId(与 cwd 二选一, 优先)'),
+      cwd: z.string().optional().describe('工作目录(不传 sessionId 时必填): 复用该目录的常驻会话, 没有则新建; 可用 workspace_list 查看'),
+      message: z.string().describe('任务内容(自然语言)'),
+      context: z.string().optional().describe('Hermes 记忆/上下文, 随任务注入给 agent 参考'),
+      newSession: z.boolean().optional().describe('true = 强制全新会话(跳过该 cwd 的池复用; 旧会话退役但持久化保留, 仍可凭 sessionId 续接)'),
+      title: z.string().optional().describe('新会话的标题(仅新建时生效; 缺省按任务内容自动派生)'),
+      model: z.string().optional().describe('本次使用的模型 id(对新建/resume 会话生效; 池复用的会话保持原模型)'),
+      provider: z.string().optional().describe('本次使用的 provider 路由(默认 deepseek-official)'),
+      preset: z.string().optional().describe('agent preset id(standard/code/cordis/minimal 等): 新建时挂载并写进 session header; resume 存量会话时也允许(在 setup 挂载该 preset)'),
+      mode: z.string().optional().describe('会话模式(仅新建会话时应用; 指定即强制全新会话)。取值见 preset_list 的 modes: 权限预设名(如 workspace-write = 沙箱 workspace-write + 审批 ask) 或沙箱模式(read-only/workspace-write/danger-full-access) 或审批策略(ask/never) 或 agent preset id'),
       sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('沙箱访问模式(显式指定, 覆盖 mode 捆绑里的值; 仅新建会话时应用)'),
       approval: z.enum(['ask', 'never']).optional().describe('审批策略(显式指定, 覆盖 mode 捆绑里的值; 仅新建会话时应用)'),
-      timeoutMs: z.number().int().min(0).optional().describe('同步等待上限毫秒数(默认 taskTimeoutMs=60 分钟; 建议按客户端 HTTP 超时设小, 如 120000; 0 = 不转异步)'),
-      title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
     },
-    async ({ task, context, cwd, sessionId, newSession, model, provider, mode, preset, sandbox, approval, timeoutMs, title }) => {
-      if (!cwd && !sessionId) {
-        return err(JSON.stringify({ error: 'cwd is required when not continuing a session (sessionId); see workspace_list for available roots' }))
+    async ({ sessionId, cwd, message, context, newSession, title, model, provider, preset, mode, sandbox, approval }) => {
+      if (!sessionId && !cwd) {
+        return err(JSON.stringify({ error: 'sessionId or cwd is required: pass sessionId to continue a session, or cwd to reuse/create the pool session for that directory (see workspace_list)' }))
       }
-      // 模式解析与前置校验: 非法 mode/preset/sandbox/approval 立即报错(不排队); sandbox/approval 不可用于续接存量会话
-      let modeRes: { preset?: string; sandbox?: string; approval?: string } | undefined
+      // 模式解析与前置校验: 非法 mode/preset/sandbox/approval 立即报错(不投喂); sandbox/approval 不可用于续接存量会话
+      let modeRes: { preset?: string; sandbox?: string; approval?: string }
       try {
         modeRes = await resolveModeRequest(ctx, { mode, preset, sandbox, approval })
       } catch (e) {
         return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
       }
-      if (sessionId && (modeRes.sandbox !== undefined || modeRes.approval !== undefined)) {
+      if (sessionId !== undefined && (modeRes.sandbox !== undefined || modeRes.approval !== undefined)) {
         return err(JSON.stringify({ error: 'mode/sandbox/approval only apply when creating a new session; pass newSession:true or omit sessionId (preset alone is allowed when resuming)' }))
       }
-      const now = Date.now()
-      // TTL 清理: 删除已完成/失败且超时的任务
-      for (const [tid, t] of taskQueue) {
-        if ((t.status === 'done' || t.status === 'error') && t.finishedAt && now - t.finishedAt > runtimeConfig.taskTtlMs) {
-          taskQueue.delete(tid)
+      // cwd 规范化: 只在显式给 cwd 时校验白名单(续接路径的目录由会话 header 决定); 新建必须有 cwd
+      let workdir = ''
+      if (cwd !== undefined && cwd !== '') {
+        workdir = await canonicalCwd(resolve(cwd))
+        if (!cwdAllowed(workdir)) {
+          return err(JSON.stringify({ error: `cwd not allowed (outside workspaceRoots): ${workdir}` }))
         }
       }
-      // 队列容量(与 task_inbox 一致): 活动任务超过上限则拒绝
-      let active = 0
-      for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') active++
-      if (active >= runtimeConfig.maxQueue) {
-        return err(JSON.stringify({ error: `task queue full (${active}/${runtimeConfig.maxQueue})` }))
-      }
-      // 统一注册为可查/可取消的任务条目: 同步完成时回填真实 taskId, 超时转异步后同一条目继续
-      const id = randomUUID()
-      const item: TaskItem = {
-        id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'running', createdAt: now,
-        ...(sessionId ? { sessionId } : {}),
-        ...(newSession ? { newSession: true } : {}),
-        ...(model ? { model } : {}),
-        ...(provider ? { provider } : {}),
-        ...(modeRes && (modeRes.preset !== undefined || modeRes.sandbox !== undefined || modeRes.approval !== undefined) ? { mode: modeRes } : {}),
-        ...(title ? { title } : {}),
-      }
-      taskQueue.set(id, item)
-      const background: Promise<TaskResult | undefined> = (async () => {
+      const modeRequested = modeRes.preset !== undefined || modeRes.sandbox !== undefined || modeRes.approval !== undefined
+      const effectiveTitle = title ?? deriveSessionTitle(message || context || '')
+      const lockKey = sessionId !== undefined ? `session:${sessionId}` : workdir
+      // 串行锁只覆盖「解析/创建 agent + 投喂」这一小段, 投喂后立即释放(不再持有到 whenIdle)
+      return withLock(lockKey, async () => {
+        let resolved: ResolvedAgent
         try {
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, {
-            fresh: item.newSession === true,
-            model: item.model,
-            provider: item.provider,
-            mode: item.mode,
-            timeoutMs: item.timeoutMs,
-            shouldAbort: () => item.cancelled === true,
-            onAgent: (agent) => {
-              // 记录会话与日志起点: 供进度提取(本任务增量)与 task_list 上下文占用
-              item.sessionId = String(agent.session.id)
-              item.baseline = ((agent.session as unknown as { log?: unknown[] }).log ?? []).length
-              taskCancelHooks.set(id, async () => {
-                item.cancelled = true
-                agent.cancel({ kind: 'hook', reason: 'harness-mcp-task-cancel' })
-              })
-            },
-          })
-          item.result.taskId = id
-          item.contextUsage = item.result.context ?? null
-          item.sessionId = item.result.sessionId
-          if (item.result.error) {
-            // 模型/执行失败: 任务以 error 结束, client 不再误判成功
-            item.error = `${item.result.error.errorCode}: ${item.result.error.errorMessage}`
-            item.status = 'error'
-          } else {
-            item.status = 'done'
-          }
-          return item.result
+          resolved = await getAgent(
+            ctx, workdir, sessionId, effectiveTitle,
+            newSession === true || (modeRequested && sessionId === undefined),
+            { provider, model }, modeRes,
+          )
         } catch (e) {
-          item.error = String(e)
-          item.status = 'error'
-          return undefined
-        } finally {
-          taskCancelHooks.delete(id)
-          item.finishedAt = Date.now()
+          return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
         }
-      })()
-      const waitMs = timeoutMs ?? runtimeConfig.taskTimeoutMs
-      let timer: ReturnType<typeof setTimeout> | undefined
-      try {
-        const result = await Promise.race([
-          background,
-          new Promise<never>((_resolve, reject) => {
-            if (waitMs > 0) timer = setTimeout(() => reject(TASK_TIMEOUT), waitMs)
-          }),
-        ])
-        if (!result) return err(JSON.stringify({ error: `task failed: ${item.error ?? 'unknown'}` }))
-        // 模型/执行失败: 同步路径也以 isError 返回, 附结构化 error + 部分输出供续接
-        if (result.error) {
-          return err(JSON.stringify({ error: result.error, taskId: id, sessionId: result.sessionId, partial: truncateResult(result) }, null, 2))
+        const agent = resolved.handle.agent
+        const sid = String(resolved.sessionId)
+        // 登记「MCP 在飞 turn」(审批/提问接管判据): 该会话 turn/end 落定时自动 -1
+        markMcpTurn(ctx, sid)
+        // 非驻池 resume 句柄: 先武装释放观测器(必须在 followup 之前, 见 releaseAfterTurn 注释),
+        // 本轮 turn 结束后 flush + dispose —— 不驻池, 也不阻塞本次调用
+        const releaseNow = resolved.disposeAfter ? releaseAfterTurn(ctx, sid, resolved.handle) : undefined
+        try {
+          agent.followup(createUserMessage({
+            content: [{ type: 'text', text: composeTaskMessage(context ?? '', message) }],
+            source: { kind: 'harness-mcp-server' },
+          }))
+        } catch (e) {
+          unmarkMcpTurn(sid)
+          await releaseNow?.()
+          return err(JSON.stringify({ error: `send failed: ${(e as Error)?.message ?? String(e)}` }))
         }
-        return out(JSON.stringify(truncateResult(result), null, 2))
-      } catch (e) {
-        if (e !== TASK_TIMEOUT) throw e
-        // 转异步: 任务在后台继续跑, 客户端用 taskId 轮询/等待/取消; 附带当前进度(含上下文占用)供汇报
+        const inbox = (agent as unknown as { inbox?: { nextTurn?: readonly unknown[]; nextStep?: readonly unknown[] } }).inbox
+        const state = liveTurnState(ctx, agent.session)
         return out(JSON.stringify({
-          status: 'async',
-          taskId: id,
-          // 实际会话 id(onAgent 就绪后回填; 任务仍在等锁时可能缺省): 转异步后调用方凭它跟进
-          // waiting_input 的审批/提问(prompt_respond)或 session_read 审计, 无需绕道 task_list
-          ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
-          progress: await taskProgressOf(ctx, item),
-          note: `task still running after ${waitMs}ms; poll via task_result / task_wait, or cancel via task_cancel`,
+          sessionId: sid,
+          ...(workdir !== '' ? { cwd: workdir } : {}),
+          status: 'accepted',
+          inboxDepth: (inbox?.nextTurn?.length ?? 0) + (inbox?.nextStep?.length ?? 0),
+          openTurn: state.openTurn,
+          ...(resolved.disposeAfter ? { note: 'resumed into a temporary handle; it is flushed and released once this turn settles' } : {}),
+          hint: 'poll session_status (or block with session_wait) for phase/lastTurn and the changes/verification/leftovers summary',
         }, null, 2))
-      } finally {
-        if (timer !== undefined) clearTimeout(timer)
-      }
+      })
     },
   )
 
-  // 异步 push 任务到队列(Hermes → Harness 任务入口)
+  // 【主动查询】turn 状态以 session log 为唯一事实源: live 读内存日志 + turnBoundaryProjection;
+  // 非 live(重启后/已退役)冷读持久化日志 —— 末尾 turn/start 无对应 turn/end 报 interrupted(进程不在了, 不是 running)。
   mcp.tool(
-    'task_inbox',
-    'Hermes 把结构化任务(任务+记忆上下文)推入 Harness 队列, 异步执行, 返回 taskId; 任务结束后的上下文占用经 task_result/task_wait/task_list 读取。可传 newSession:true 强制全新会话; 可传 preset/mode/sandbox/approval 指定会话模式(创建会话时应用, 指定即强制全新会话, 避免后续再提权)。',
-    {
-      task: z.string().describe('任务内容'),
-      context: z.string().optional().describe('Hermes 记忆/上下文, 随任务注入给 agent'),
-      cwd: z.string().optional().describe('工作目录'),
-      sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
-      newSession: z.boolean().optional().describe('true = 强制全新会话(不复用该 cwd 的常驻会话); 缺省 = 复用'),
-      model: z.string().optional().describe('本次任务使用的模型 id(对新建/resume 会话生效)'),
-      provider: z.string().optional().describe('本次任务使用的 provider 路由(默认 deepseek-official)'),
-      mode: z.string().optional().describe('会话模式(创建新会话时应用; 指定即强制全新会话)。取值见 mode_list 的 modes: agent preset id 或权限预设名(如 workspace-write = 沙箱 workspace-write + 审批 ask) 或沙箱模式(read-only/workspace-write/danger-full-access) 或审批策略(ask/never)'),
-      preset: z.string().optional().describe('agent preset id(standard/code/cordis/minimal 等; 挂载到新会话, 写进 session header 的 agentPreset)。resume 存量会话时也允许'),
-      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('沙箱访问模式(显式指定, 覆盖 mode 捆绑里的值; 仅新建会话时应用)'),
-      approval: z.enum(['ask', 'never']).optional().describe('审批策略(显式指定, 覆盖 mode 捆绑里的值; 仅新建会话时应用)'),
-      timeoutMs: z.number().int().min(0).optional().describe('本次任务的执行超时毫秒数(默认 taskTimeoutMs=60 分钟; 超时自动 cancel 并回收部分输出; 0 = 不限制)'),
-      title: z.string().optional().describe('新会话的标题(创建时命名)'),
+    'session_status',
+    '主动查询会话/turn 状态(唯一事实源 = session log, 重启不丢): phase(idle/running/waiting_input/interrupted)、openTurn{turn,startedSeq}、lastTurn{turn,reason{kind,error?}}、prompts[](待响应的审批/提问)、context(events/tokens/pressure/window/ratio; 仅 live 可测, 非 live 为 null)、changes/verification/leftovers(从最后一个 turn 边界内的 assistant 文本 parseSummary 提取, 提不到为 null)、lastText。',
+    { sessionId: z.string().describe('会话 id(session_send 返回的 sessionId; live/persisted 均可)') },
+    async ({ sessionId }) => {
+      const status = await buildSessionStatus(ctx, sessionId)
+      if (status === undefined) {
+        return err(JSON.stringify({ error: `session not found: ${sessionId} (not live in this process and not persisted under ${join(dshHome(), 'sessions')})` }))
+      }
+      return out(JSON.stringify(status, null, 2))
     },
-    async ({ task, context, cwd, sessionId, newSession, model, provider, mode, preset, sandbox, approval, timeoutMs, title }) => {
-      if (!cwd && !sessionId) {
-        return err(JSON.stringify({ error: 'cwd is required when not continuing a session (sessionId); see workspace_list for available roots' }))
-      }
-      // 模式解析与前置校验: 非法 mode/preset/sandbox/approval 立即报错(不排队); sandbox/approval 不可用于续接存量会话
-      let modeRes: { preset?: string; sandbox?: string; approval?: string } | undefined
-      try {
-        modeRes = await resolveModeRequest(ctx, { mode, preset, sandbox, approval })
-      } catch (e) {
-        return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
-      }
-      if (sessionId && (modeRes.sandbox !== undefined || modeRes.approval !== undefined)) {
-        return err(JSON.stringify({ error: 'mode/sandbox/approval only apply when creating a new session; pass newSession:true or omit sessionId (preset alone is allowed when resuming)' }))
-      }
-      const now = Date.now()
-      // TTL 清理: 删除已完成/失败且超时的任务
-      for (const [tid, t] of taskQueue) {
-        if ((t.status === 'done' || t.status === 'error') && t.finishedAt && now - t.finishedAt > runtimeConfig.taskTtlMs) {
-          taskQueue.delete(tid)
+  )
+
+  // 【过程明细】按需拉取表面事件(修掉 session_read 对 LLM 不友好的两点: '(no text blocks)' 噪声 + 98% 内部事件)
+  mcp.tool(
+    'session_tail',
+    '按需拉取会话最近的过程明细(只含表面事件, 内部流式事件全部滤除): user/assistant 消息文本、tool/call 与 tool/result 摘要、turn/start|end 边界。每条 {seq,type,text(≤2k),turn}。n = 返回条数(默认 5), sinceSeq = 只看该 seq 之后的事件, filter = all|surface|tools(surface = 消息文本与 turn 边界, tools = 工具调用与结果)。空文本的 assistant 消息直接跳过(不再出现 "(no text blocks)")。',
+    {
+      sessionId: z.string().describe('会话 id(live/persisted 均可)'),
+      n: z.number().int().min(1).max(200).optional().describe('最多返回多少条表面事件(默认 5)'),
+      sinceSeq: z.number().int().min(0).optional().describe('只返回 seq 大于该值的事件'),
+      filter: z.enum(['all', 'surface', 'tools']).optional().describe('事件类别过滤(默认 all)'),
+    },
+    async ({ sessionId, n, sinceSeq, filter }) => {
+      const count = n ?? 5
+      const mode = filter ?? 'all'
+      const agent = liveAgentFor(ctx, sessionId) as Agent | undefined
+      let events: readonly unknown[]
+      let source: 'live' | 'persisted'
+      let total: number
+      if (agent !== undefined) {
+        events = sessionEventsOf(agent.session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
+        source = 'live'
+        total = events.length
+      } else {
+        const cold = await readColdLog(ctx, sessionId, Math.max(2000, count * 50))
+        if (cold === undefined) {
+          return err(JSON.stringify({ error: `session not found: ${sessionId} (not live in this process and not persisted)` }))
         }
+        events = cold.events
+        source = 'persisted'
+        total = cold.total
       }
-      // 队列容量上限: 活动任务(排队+执行中)超过上限则拒绝
-      let active = 0
-      for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') active++
-      if (active >= runtimeConfig.maxQueue) {
-        return err(JSON.stringify({ error: `task queue full (${active}/${runtimeConfig.maxQueue})` }))
-      }
-      const id = randomUUID()
-      const item: TaskItem = {
-        id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
-        ...(sessionId ? { sessionId } : {}),
-        ...(newSession ? { newSession: true } : {}),
-        ...(model ? { model } : {}),
-        ...(provider ? { provider } : {}),
-        ...(modeRes && (modeRes.preset !== undefined || modeRes.sandbox !== undefined || modeRes.approval !== undefined) ? { mode: modeRes } : {}),
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-        ...(title ? { title } : {}),
-      }
-      taskQueue.set(id, item)
-      // 异步执行(不阻塞 Hermes); agent 就绪后注册打断钩子, 供 task_cancel 主动打断
-      void (async () => {
-        item.status = 'running'
-        try {
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, {
-            fresh: item.newSession === true,
-            model: item.model,
-            provider: item.provider,
-            mode: item.mode,
-            timeoutMs: item.timeoutMs,
-            shouldAbort: () => item.cancelled === true,
-            onAgent: (agent) => {
-              // 记录会话与日志起点: 供进度提取(本任务增量)与 task_list 上下文占用
-              item.sessionId = String(agent.session.id)
-              item.baseline = ((agent.session as unknown as { log?: unknown[] }).log ?? []).length
-              taskCancelHooks.set(id, async () => {
-                item.cancelled = true
-                agent.cancel({ kind: 'hook', reason: 'harness-mcp-task-cancel' })
-              })
-            },
-          })
-          item.result.taskId = id
-          item.contextUsage = item.result.context ?? null
-          item.sessionId = item.result.sessionId // 回填实际使用的会话, 供 task_list 附上下文占用/后续续接
-          if (item.result.error) {
-            // 模型/执行失败: 任务以 error 结束, client 不再误判成功
-            item.error = `${item.result.error.errorCode}: ${item.result.error.errorMessage}`
-            item.status = 'error'
-          } else {
-            item.status = 'done'
-          }
-        } catch (e) {
-          item.error = String(e)
-          item.status = 'error'
-        } finally {
-          taskCancelHooks.delete(id)
-          item.finishedAt = Date.now()
+      const types = mode === 'tools'
+        ? new Set(['tool/call', 'tool/result'])
+        : mode === 'surface'
+          ? new Set(['user/message', 'assistant/message', 'turn/start', 'turn/end'])
+          : new Set(['user/message', 'assistant/message', 'tool/call', 'tool/result', 'turn/start', 'turn/end'])
+      const rows: Array<{ seq?: number; type: string; text: string; turn?: number }> = []
+      let currentTurn: number | undefined
+      for (const raw of events) {
+        const e = raw as EventView
+        const type = e.type
+        if (type === undefined) continue
+        if (type === 'turn/start') currentTurn = Number((e.data as { turn?: unknown } | undefined)?.turn ?? 0)
+        if (!types.has(type)) continue
+        if (sinceSeq !== undefined && typeof e.seq === 'number' && e.seq <= sinceSeq) continue
+        let text = ''
+        if (type === 'user/message' || type === 'assistant/message') {
+          text = messageTextOf(e)
+          if (text === '') continue // 空文本消息不返回(修 '(no text blocks)' 噪声)
+        } else if (type === 'tool/call') {
+          const d = e.data as { name?: string; arguments?: unknown; input?: unknown } | undefined
+          const args = d?.arguments !== undefined ? String(d.arguments) : JSON.stringify(d?.input ?? null) ?? ''
+          text = `${d?.name ?? '?'}(${args.slice(0, 2000)})`
+        } else if (type === 'tool/result') {
+          const texts: string[] = []
+          extractText(e.data ?? raw, texts)
+          text = texts.join('\n').slice(0, 2000) || '(empty result)'
+        } else if (type === 'turn/start') {
+          text = `turn ${currentTurn ?? 0} start`
+        } else if (type === 'turn/end') {
+          const d = e.data as { turn?: unknown; reason?: { kind?: unknown } } | undefined
+          text = `turn ${Number(d?.turn ?? currentTurn ?? 0)} end (${String(d?.reason?.kind ?? 'unknown')})`
         }
-      })()
-      // 队列已接收: context 恒 null(任务未开始, 无会话可测); 执行中/结束后的占用经 task_result/task_wait/task_list 读取。
-      // sessionId 仅当调用方显式传入时回显(此时是「请求续接的会话」); 未传时实际会话由执行期 getAgent
-      // 决定(池复用/新建), 待 agent 就绪后经 task_result/task_list 的 sessionId 字段可见。
-      return out(JSON.stringify({
-        taskId: id,
-        status: 'queued',
-        ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
-        context: null,
-      }))
-    },
-  )
-
-  // 取回任务结果(结构化 changes/verification/leftovers; 未完成时带进行中进度)
-  mcp.tool(
-    'task_result',
-    '取回 task_inbox 提交任务的结构化结果(changes/verification/leftovers); 未完成时返回 progress 供汇报进度; 附任务会话上下文占用 context(events/tokens/pressure/window/ratio)。',
-    { taskId: z.string().describe('task_inbox 返回的 taskId') },
-    async ({ taskId }) => {
-      const item = taskQueue.get(taskId)
-      if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
-      return out(JSON.stringify({
-        taskId: item.id,
-        // 实际会话 id(onAgent 就绪后回填, 池复用/新建时可能 ≠ 传入的 resume id; 未就绪时省略):
-        // waiting_input 时与 progress.prompts 的 promptId 配对直调 prompt_respond, 无需绕道 task_list
-        sessionId: item.sessionId,
-        status: item.status,
-        error: item.error,
-        cancelled: item.cancelled === true || undefined,
-        context: item.contextUsage ?? null,
-        progress: await taskProgressOf(ctx, item),
-        result: item.result ? truncateResult(item.result) : undefined,
-      }, null, 2))
-    },
-  )
-
-  // 阻塞等待任务完成: 一次往返替代 N 次轮询(服务端每 500ms 查一次, 到 timeoutMs 或任务落定返回);
-  // 无论完成还是超时, 都附带 progress(进行中的步骤/已用工具/最新文本)供客户端汇报进度
-  mcp.tool(
-    'task_wait',
-    '阻塞等待一个任务完成/失败后返回其结果(服务端等待, 一次往返替代多次轮询); 超过 timeoutMs 返回当前状态与 progress(正在执行的步骤/工具调用/上下文占用)。客户端 HTTP 超时应大于 timeoutMs。',
-    {
-      taskId: z.string().describe('task_inbox / agent_run(转异步)返回的 taskId'),
-      timeoutMs: z.number().int().min(100).max(600000).optional().describe('等待上限毫秒数(默认 60000; 上限 10 分钟)'),
-    },
-    async ({ taskId, timeoutMs }) => {
-      const item = taskQueue.get(taskId)
-      if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
-      const wait = timeoutMs ?? 60000
-      const deadline = Date.now() + wait
-      while (item.status === 'queued' || item.status === 'running') {
-        const remain = deadline - Date.now()
-        if (remain <= 0) break
-        await new Promise((r) => setTimeout(r, Math.min(500, remain)))
-      }
-      return out(JSON.stringify({
-        taskId: item.id,
-        // 实际会话 id(onAgent 就绪后回填, 池复用/新建时可能 ≠ 传入的 resume id; 未就绪时省略):
-        // waiting_input 时与 progress.prompts 的 promptId 配对直调 prompt_respond, 无需绕道 task_list
-        sessionId: item.sessionId,
-        status: item.status,
-        error: item.error,
-        cancelled: item.cancelled === true || undefined,
-        context: item.contextUsage ?? null,
-        progress: await taskProgressOf(ctx, item),
-        result: item.result ? truncateResult(item.result) : undefined,
-      }, null, 2))
-    },
-  )
-
-  // 列出最近任务: 供批量轮询与队列观察(task_result 只能逐个查); 可按 sessionId 过滤
-  mcp.tool(
-    'task_list',
-    '列出最近的任务(taskId/状态/目录/时间/会话上下文/进行中进度), 便于批量轮询与观察队列; 按 createdAt 倒序, 可按 sessionId 过滤。',
-    {
-      limit: z.number().int().min(1).max(200).optional().describe('最多返回条数(默认 20)'),
-      sessionId: z.string().optional().describe('只返回使用了该会话的任务'),
-    },
-    async ({ limit, sessionId }) => {
-      const n = limit ?? 20
-      const items = [...taskQueue.values()]
-        .filter((t) => !sessionId || t.sessionId === sessionId)
-        .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, n)
-      const tasks = []
-      for (const t of items) {
-        // 任务所用会话仍 live 时附上实时上下文占用(池优先); 已退役/未加载则回退任务完成时快照(仍为 null 表示无法测量)
-        const agent = liveAgentFor(ctx, t.sessionId)
-        const context = agent ? await contextUsage(ctx, agent.session, agent) : (t.contextUsage ?? null)
-        const progress = t.status === 'queued' || t.status === 'running' ? await taskProgressOf(ctx, t) : undefined
-        tasks.push({
-          taskId: t.id,
-          status: t.status,
-          cwd: t.cwd,
-          sessionId: t.sessionId,
-          createdAt: t.createdAt,
-          finishedAt: t.finishedAt,
-          cancelled: t.cancelled === true || undefined,
-          timeout: t.result?.timeout === true || undefined,
-          error: t.error,
-          hasResult: t.result !== undefined,
-          context,
-          progress,
+        rows.push({
+          ...(typeof e.seq === 'number' ? { seq: e.seq } : {}),
+          type,
+          text: text.slice(0, 2000),
+          ...(currentTurn !== undefined ? { turn: currentTurn } : {}),
         })
       }
-      return out(JSON.stringify({ total: taskQueue.size, tasks }, null, 2))
+      const tail = rows.slice(Math.max(0, rows.length - count))
+      return out(JSON.stringify({
+        sessionId, source, logEvents: total, surfaceEvents: rows.length, returned: tail.length,
+        ...(sinceSeq !== undefined ? { sinceSeq } : {}),
+        ...(filter !== undefined ? { filter: mode } : {}),
+        events: tail,
+      }, null, 2))
     },
   )
 
-  // 打断一个 queued/running 任务: 与超时保护共用 agent.cancel 路径
+  // 【可选阻塞】单段 ≤240s 等 turn-end / idle / input; 非 live 立即返回 session_status; 超时返回 {timeout:true, status}
   mcp.tool(
-    'task_cancel',
-    '打断一个 queued/running 的任务(cancel agent 当前回合, 回收部分输出); 已结束的任务为幂等 no-op。',
-    { taskId: z.string().describe('task_inbox 返回的 taskId') },
-    async ({ taskId }) => {
-      const item = taskQueue.get(taskId)
-      if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
-      if (item.status === 'done' || item.status === 'error') {
-        return out(JSON.stringify({ taskId, sessionId: item.sessionId, status: item.status, cancelled: false, note: 'already finished' }))
+    'session_wait',
+    '可选地阻塞等待一段(单段 ≤240s): until=turn-end(等指定/当前 turn 结束) | idle(等会话彻底空闲) | input(等出现待响应弹窗)。事件驱动 + 500ms 兜底轮询; 超时返回 {timeout:true, status}, 落定返回 {timeout:false, status}。非 live 会话无法等待(进程已不在), 立即返回 {live:false, status}(用 session_status 冷读)。',
+    {
+      sessionId: z.string().describe('会话 id'),
+      until: z.enum(['turn-end', 'idle', 'input']).optional().describe('等待目标(默认 turn-end)'),
+      timeoutMs: z.number().int().min(0).max(MAX_WAIT_MS).optional().describe('等待上限毫秒数(默认 60000, 上限 240000)'),
+      sinceTurn: z.number().int().min(1).optional().describe('只等该 turn 号(含)之后的 turn 结束; 缺省 = 当前在飞 turn, 没有在飞 turn 时 = 下一个 turn'),
+    },
+    async ({ sessionId, until, timeoutMs, sinceTurn }) => {
+      const target = until ?? 'turn-end'
+      const cap = Math.min(timeoutMs ?? 60000, MAX_WAIT_MS)
+      const startedAt = Date.now()
+      const agent = liveAgentFor(ctx, sessionId) as Agent | undefined
+      if (agent === undefined) {
+        const status = await buildSessionStatus(ctx, sessionId)
+        if (status === undefined) {
+          return err(JSON.stringify({ error: `session not found: ${sessionId} (not live in this process and not persisted)` }))
+        }
+        return out(JSON.stringify({
+          sessionId, live: false, until: target, timeout: false, waitedMs: 0,
+          reason: 'session is not live in this process (after a restart nothing is running); returning the current status instead of blocking',
+          status,
+        }, null, 2))
       }
-      const cancel = taskCancelHooks.get(taskId)
-      if (!cancel) {
-        // agent 未就绪(等锁/排队中): 置 cancelled 标记, executeTask 在锁释放后执行前检查并中止
-        item.cancelled = true
-        // sessionId 未就绪时为 undefined(JSON 序列化自动省略)
-        return out(JSON.stringify({ taskId, sessionId: item.sessionId, status: item.status, cancelled: true, note: 'cancel requested before agent started; will abort on start' }))
+      const start = liveTurnState(ctx, agent.session)
+      const minTurn = sinceTurn ?? (start.openTurn !== null ? start.openTurn.turn : (start.lastTurn?.turn ?? 0) + 1)
+      const settled = await waitForSettle(ctx, sessionId, agent, target, cap, minTurn)
+      const status = await buildSessionStatus(ctx, sessionId)
+      return out(JSON.stringify({
+        sessionId, live: true, until: target, timeout: !settled, waitedMs: Date.now() - startedAt,
+        ...(settled ? {} : { note: `not settled within ${cap}ms; poll session_status again or retry with a larger timeoutMs (max ${MAX_WAIT_MS})` }),
+        ...(status !== undefined ? { status } : {}),
+      }, null, 2))
+    },
+  )
+
+  // 打断会话当前回合(替代旧 task_cancel): 走 agent.cancel, turn/end reason.kind='aborted'
+  mcp.tool(
+    'session_cancel',
+    "打断会话当前的 turn(agent.cancel {kind:'hook',reason:'harness-mcp-cancel'}): 中止活动回合并(缺省)清空未开始的排队输入, 回落 turn/end reason.kind='aborted'。keepInbox=true 保留排队输入。非 live(重启后)会话无可打断, 返回 noop —— 用 session_status 冷读其状态。",
+    {
+      sessionId: z.string().describe('会话 id'),
+      keepInbox: z.boolean().optional().describe('true = 保留未开始的排队输入(缺省清空)'),
+    },
+    async ({ sessionId, keepInbox }) => {
+      const agent = liveAgentFor(ctx, sessionId) as Agent | undefined
+      if (agent === undefined) {
+        return out(JSON.stringify({
+          sessionId, live: false, cancelled: false,
+          note: 'session is not live in this process; nothing to cancel (its log is the source of truth — query session_status)',
+        }))
       }
+      // 缺省 keepInbox=false 会丢弃队列里待 claim 的输入 —— 那些 turn 永远不会开, 计数要按丢弃条数扣掉;
+      // 活动回合的计数由它自己的 turn/end(aborted)事件扣。这里再扣一次会低估在飞工作(取消后队列里
+      // 仍有待 claim 的 MCP 投喂时会让计数提前归零)。
+      const queuedBefore = (agent as unknown as { inbox?: { nextTurn?: readonly unknown[] } }).inbox?.nextTurn?.length ?? 0
       try {
-        await cancel()
+        agent.cancel({ kind: 'hook', reason: 'harness-mcp-cancel' }, keepInbox === undefined ? undefined : { keepInbox })
       } catch (e) {
         return err(JSON.stringify({ error: `cancel failed: ${(e as Error)?.message ?? String(e)}` }))
       }
-      return out(JSON.stringify({ taskId, sessionId: item.sessionId, status: item.status, cancelled: true }))
+      if (keepInbox !== true) for (let i = 0; i < queuedBefore; i++) unmarkMcpTurn(sessionId)
+      const state = liveTurnState(ctx, agent.session)
+      return out(JSON.stringify({
+        sessionId, live: true, cancelled: true, keepInbox: keepInbox === true,
+        openTurn: state.openTurn,
+        note: "agent cancelled; the turn closes with turn/end reason.kind='aborted'",
+      }, null, 2))
     },
   )
 
@@ -2155,7 +2267,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     'rename_session',
     '给已有会话改名(走 sessionTitle 服务的 rename), 便于会话列表归档区分。',
     {
-      sessionId: z.string().describe('要改名的会话 id(来自 agent_run 结果里的 sessionId 字段)'),
+      sessionId: z.string().describe('要改名的会话 id(来自 session_send 结果或 session_list)'),
       title: z.string().describe('新标题'),
     },
     async ({ sessionId, title }) => {
@@ -2210,8 +2322,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         })
       }
       // 持久化(未在上两层出现的会话; 日志未加载, 上下文未知; 仅 header 已知 preset)
-      const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<{ id: unknown; cwd?: string; agentPreset?: string }[]> } | undefined
-      for (const h of (await persistence?.list?.()) ?? []) {
+      const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
+      for (const row of (await persistence?.list?.()) ?? []) {
+        // 0.2: list() 行是 { header, revision, ... }, id/cwd/agentPreset 在 row.header 上
+        const h = persistedRowHeaderOf(row)
         const id = String(h.id)
         if (!rows.has(id)) {
           const preset = h.agentPreset ?? runtimeConfig.preset
@@ -2222,39 +2336,6 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         .map(([sessionId, info]) => ({ sessionId, ...info }))
         .sort((a, b) => (a.cwd ?? '').localeCompare(b.cwd ?? ''))
       return out(JSON.stringify({ total: sessions.length, sessions }, null, 2))
-    },
-  )
-
-  // 显式退役池会话: 外部主动释放常驻句柄(会话保留在持久化, 仍可凭 sessionId 续接)
-  mcp.tool(
-    'session_close',
-    '显式退役一个常驻池会话(dispose 句柄并移出池; 会话保留在持久化, 仍可凭 sessionId 续接)。只能关闭本插件池里的会话; live/persisted 会话归其创建者所有, 返回 no-op。',
-    {
-      sessionId: z.string().describe('要退役的会话 id(来自 session_list 或 agent_run 结果的 sessionId 字段)'),
-    },
-    async ({ sessionId }) => {
-      let targetCwd: string | undefined
-      for (const [cwd, rec] of liveAgents) {
-        if (String(rec.sessionId) === sessionId) { targetCwd = cwd; break }
-      }
-      if (targetCwd === undefined) {
-        return out(JSON.stringify({ sessionId, closed: false, note: 'not in pool (pool only; live/persisted sessions are owned by their creator)' }))
-      }
-      const rec = liveAgents.get(targetCwd) as ResolvedAgent | undefined
-      if (!rec) return out(JSON.stringify({ sessionId, closed: false, note: 'already closed' }))
-      // 忙会话不掐: 正在跑任务的会话拒绝退役, 引导先取消任务
-      const status = (rec.handle.agent as unknown as { status?: string }).status
-      if (status !== 'idle') {
-        return out(JSON.stringify({ sessionId, cwd: targetCwd, closed: false, note: 'busy: session has a running task; use task_list / task_cancel first' }))
-      }
-      liveAgents.delete(targetCwd)
-      sessionToCwd.delete(sessionId)
-      try {
-        await rec.handle.dispose()
-      } catch (e) {
-        return err(JSON.stringify({ error: `dispose failed: ${(e as Error)?.message ?? String(e)}` }))
-      }
-      return out(JSON.stringify({ sessionId, cwd: targetCwd, closed: true, note: 'session persisted; resumable by sessionId' }))
     },
   )
 
@@ -2347,13 +2428,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       for (const pq of pendingQuestions.values()) {
         if (!sessionId || pq.agentId === sessionId) prompts.push({ sessionId: pq.agentId, type: 'question', id: pq.promptId, questions: pq.questions })
       }
-      // web GUI 持有提问 provider 时, MCP 会话里挂起的 ask_user_question 调用仍可感知(应答在 GUI)
+      // 本插件未接管提问时(questionsProviderOurs=false), MCP 会话里挂起的 ask_user_question 仍可感知(应答在 GUI)
       if (!questionsProviderOurs) {
         for (const sid of (sessionId ? [sessionId] : [...mcpSessionIds])) {
           const agent = liveAgentFor(ctx, sid)
           const detected = agent !== undefined ? detectPendingAskUser(agent.session) : undefined
           if (detected) {
-            prompts.push({ sessionId: sid, type: 'question', id: detected.id, questions: detected.questions, note: 'routed to the web GUI provider; answer in the DSH web UI' })
+            prompts.push({ sessionId: sid, type: 'question', id: detected.id, questions: detected.questions, note: 'not claimed by MCP (MCP only claims questions asked while it drives the session); answer it in the DSH web UI' })
           }
         }
       }
@@ -2367,7 +2448,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     '响应等待中的弹窗: 审批用 decision=approve|deny(approve 为一次性授权, 绝不自动放行——每次审批都必须显式决策); 提问用 answer 自由文本。响应后 agent 解除阻塞继续执行。',
     {
       sessionId: z.string().describe('弹窗所属会话 id'),
-      promptId: z.string().describe('pending_prompts / progress 返回的 prompt id'),
+      promptId: z.string().describe('pending_prompts / session_status 返回的 prompt id'),
       decision: z.enum(['approve', 'deny']).optional().describe('审批类弹窗的决策(approve=放行一次, deny=拒绝)'),
       answer: z.string().optional().describe('提问类弹窗的自由文本回答'),
     },
@@ -2390,11 +2471,11 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         pq.resolve({ answers: answered })
         return out(JSON.stringify({ ok: true, promptId, type: 'question', answered: answered.length }, null, 2))
       }
-      // 未挂起: 若是 GUI 路由的挂起提问则给出明确指引
+      // 未挂起: 若是 MCP 未接管、由 web GUI 应答链处理的挂起提问, 给出明确指引
       const agent = liveAgentFor(ctx, sessionId)
       const detected = agent !== undefined ? detectPendingAskUser(agent.session) : undefined
       if (detected !== undefined && detected.id === promptId && !questionsProviderOurs) {
-        return err(JSON.stringify({ error: 'this question is routed to the web GUI provider; answer it in the DSH web UI (the MCP-side provider slot is owned by the GUI in this deployment)' }))
+        return err(JSON.stringify({ error: 'this question was not claimed by MCP (MCP only claims questions asked while it drives the session); answer it in the DSH web UI' }))
       }
       return err(JSON.stringify({ error: `prompt not found: ${promptId}` }))
     },
@@ -2461,7 +2542,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         return err(JSON.stringify({ error: 'agent inbox unavailable' }))
       }
       try {
-        const msg = createUserMessage({ content: [{ type: 'text', text: message }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } })
+        const msg = createUserMessage({ content: [{ type: 'text', text: message }], source: { kind: 'harness-mcp-server' } })
         inbox.append(target ?? 'next-turn', msg as never)
       } catch (e) {
         if (resolved.disposeAfter) { try { await resolved.handle.dispose() } catch { /* ignore */ } }
@@ -2519,28 +2600,25 @@ function registerTools(mcp: McpServer, ctx: Context): void {
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。
  */
-export async function apply(ctx: Context, config: Config = {}): Promise<void> {
-  // 初始化运行时配置(覆盖默认值)
+export async function apply(ctx: Context, config: Partial<Config> = {}): Promise<void> {
+  // 初始化运行时配置(覆盖默认值); host/port/authToken 三个 volatile 字段改为下面 effect 里读取
   if (config.provider) runtimeConfig.provider = config.provider
   if (config.model) runtimeConfig.model = config.model
   if (config.preset) runtimeConfig.preset = config.preset
-  if (config.maxQueue !== undefined) runtimeConfig.maxQueue = config.maxQueue
-  if (config.taskTtlMs !== undefined) runtimeConfig.taskTtlMs = config.taskTtlMs
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
   if (config.taskTimeoutMs !== undefined) runtimeConfig.taskTimeoutMs = config.taskTimeoutMs
-  if (config.authToken) runtimeConfig.authToken = config.authToken
   if (config.authTokens?.length) runtimeConfig.authTokens = [...config.authTokens]
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
-  // 生效监听配置: 入口 config 引导; 有 settings 服务时被用户层(设置界面)覆盖, 见下方注册段
-  let effectiveHost = config.host ?? '127.0.0.1'
-  let effectivePort = config.port ?? 8090
+  // 生效监听配置: 入口 config 引导; volatile 字段(host/port/authToken)随后被设置页订阅覆盖
+  let effectiveHost = readField(config.host, '127.0.0.1')
+  let effectivePort = readField(config.port, 8090)
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
   console.log('[harness-mcp-server] apply called, port=', effectivePort)
 
-  // ── 审批应答者: 正被 MCP 任务驱动的会话, 审批一律转达调用方, 绝不自动放行 ──
-  // prepend 抢在 web GUI 应答者之前认领审批; 仅当会话属 MCP(mcpSessionIds)且此刻正被 MCP 任务驱动
-  // (mcpBusySessionIds: 当前有 agent_run/task_inbox 在跑)才接管转达调用方(Hermes);
+  // ── 审批应答者: 正被 MCP 投喂驱动的会话, 审批一律转达调用方, 绝不自动放行 ──
+  // prepend 抢在 web GUI 应答者之前认领审批; 仅当会话属 MCP(mcpSessionIds)且此刻正被 MCP 投喂驱动
+  // (mcpPendingTurns: 当前有 session_send 投喂的 turn 尚未落定)才接管转达调用方(Hermes);
   // 否则(例如用户经 web UI 直接向 MCP 创建过的会话发消息、此刻没有 MCP 任务在跑)不接管,
   // next() 交给 web GUI 应答链 —— 避免接管后 Hermes 调用方不知情/无法响应、web UI 也弹不出
   // 审批窗的双端死锁(旧版只看 mcpSessionIds 的死锁根因)。
@@ -2549,8 +2627,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (req.signal?.aborted) return Promise.resolve('cancelled')
     // 防御: agent.id 为权威; 个别实现只挂 session.id 时兜底
     const agentId = String(req.agent.id ?? (req.agent.session as { id?: unknown } | undefined)?.id)
-    // 仅当会话属 MCP 且正被 MCP 任务驱动才接管转达调用方; 否则交给 web GUI 应答链
-    if (!mcpSessionIds.has(agentId) || !mcpBusySessionIds.has(agentId)) return next()
+    // 仅当会话属 MCP 且有 MCP 在飞 turn 才接管转达调用方; 否则交给 web GUI 应答链
+    if (!mcpSessionIds.has(agentId) || !mcpTurnInFlight(agentId, req.agent)) return next()
     const promptId = approvalPromptIdOf(req)
     return new Promise<string>((resolve) => {
       let settled = false
@@ -2596,65 +2674,115 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     },
   )
 
-  // ── 提问 provider: 单槽能力缝; web GUI 已占用时降级(提问路由到 GUI, MCP 仍可感知但需在 GUI 应答) ──
+  // ── 提问应答者: 把挂起的 ask_user_question 交接给 MCP 调用方(用 prompt_respond 应答) ──
+  // dsh-user-questions 有两代宿主形态, 用 API 探测兼容(两版宿主都要能跑):
+  //   ① ≤0.1.1(旧版): UserQuestionService 有单槽 registerProvider(provider) —— 先到先得, 注册成功即全量接管;
+  //   ② ≥0.2.0-rc.1(新版): registerProvider 被删除(2026-09 升级), 改为 Agent 作用域 waterfall 事件
+  //      'user-questions/request'。web GUI 客户端以 ctx.remote.$on 挂在同一事件上, waterfall 语义
+  //      outermost-first、不调 next() 即 veto 后续 listener —— 故用 prepend 抢先认领(与 approval/request 同款)。
+  // ⚠️ 只试 ①(旧代码)正是本 bug 的根因: 0.2.0-rc.1 上 registerProvider 为 undefined → 静默跳过注册 →
+  //    questionsProviderOurs=false → 提问全落到 GUI listener → prompt_respond 走「未挂起」拒绝分支。
+  interface UserQuestionRequestView {
+    questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
+    agent?: { id: unknown; session?: unknown }
+    signal?: AbortSignal
+  }
+
+  /** 提问交接实现(两版宿主共用): 生成 promptId → 挂 pendingQuestions → 等 prompt_respond / abort 落定。
+   *  返回 AskUserQuestionAnswer = { answers: [{ id, selected, custom }] } ——
+   *  已对照 0.2.0-rc.1 lib/types/types.d.ts 确认答案形态与 0.1.1 一致(selected 可为空数组, 自由文本走 custom)。 */
+  const answerQuestionViaMcp = (request: unknown): Promise<{ answers: Array<{ id: string; selected: string[]; custom?: string }> }> => {
+    const r = request as UserQuestionRequestView
+    const promptId = `q-${randomUUID()}`
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const settle = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        pendingQuestions.delete(promptId)
+        r.signal?.removeEventListener('abort', onAbort)
+        fn()
+      }
+      const onAbort = () => settle(() => reject(new Error('ask_user_question was aborted before the user answered')))
+      pendingQuestions.set(promptId, {
+        promptId,
+        agentId: r.agent !== undefined ? String(r.agent.id) : '(host)',
+        questions: r.questions.map((q) => ({
+          id: q.id,
+          question: q.question,
+          ...(q.detail !== undefined ? { detail: q.detail } : {}),
+          ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
+        })),
+        resolve: (answer) => settle(() => {
+          // 【2】web UI 提示(入队, 工具完成后安全落点): 提问已由 MCP 响应
+          if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, '✅ 提问已由 MCP 回答')
+          resolve(answer)
+        }),
+        reject: (e) => settle(() => {
+          if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, '❌ 提问已取消/失败')
+          reject(e)
+        }),
+      })
+      r.signal?.addEventListener('abort', onAbort, { once: true })
+      // 【2+3】web UI 提示: 该提问已被 MCP 拦截接管 —— ⏳ 走挂起期即时投递
+      // (notifyPromptIntercepted, 同审批; 拦截期不可直接写 user/message, 见该函数注释)
+      if (r.agent !== undefined) {
+        const first = r.questions[0]
+        notifyPromptIntercepted(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
+      }
+    })
+  }
+
+  /** 提问接管判据(与 onApprovalRequest 同判据): 会话属 MCP 且此刻正被 MCP 任务驱动才认领,
+   *  否则 next() 透传给 web GUI 应答链 —— 用户经 web UI 直接向「MCP 用过的会话」发消息时, 提问照常
+   *  弹在 GUI, 不会 MCP/GUI 两端都收不到而挂死(审批应答者 0.9.10 已按同一判据收紧, 提问沿用同闸)。
+   *  【放宽】若要复刻旧版 registerProvider 的「无条件全量接管」, 让本函数恒返回 true 即可; 但那样
+   *  web GUI 自己发起的提问也会被 MCP 抢走而无人应答(GUI 不再渲染问题卡), 故默认不做。 */
+  const mcpOwnsQuestion = (request: unknown): boolean => {
+    const agent = (request as { agent?: unknown } | undefined)?.agent
+    const agentId = agentIdOf(agent)
+    return agentId !== undefined && mcpSessionIds.has(agentId) && mcpTurnInFlight(agentId, agent)
+  }
+
   const userQuestions = ctx.get('userQuestions') as {
     registerProvider?: (p: { ask: (request: unknown) => Promise<unknown> }) => () => void
   } | undefined
-  if (userQuestions?.registerProvider) {
+
+  let questionAnswererMode: 'legacy-provider' | 'waterfall-listener' | 'none' = 'none'
+  const legacyRegisterProvider = userQuestions?.registerProvider
+  if (typeof legacyRegisterProvider === 'function') {
+    // ① 旧版宿主(≤0.1.1): 单槽 provider。槽被 GUI 占先时抛 DUPLICATE_PROVIDER → 保持不接管(旧行为不变)
     try {
-      userQuestions.registerProvider({
-        ask: (request) => {
-          const r = request as {
-            questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
-            agent?: { id: unknown; session?: unknown }
-            signal?: AbortSignal
-          }
-          const promptId = `q-${randomUUID()}`
-          return new Promise((resolve, reject) => {
-            let settled = false
-            const settle = (fn: () => void) => {
-              if (settled) return
-              settled = true
-              pendingQuestions.delete(promptId)
-              r.signal?.removeEventListener('abort', onAbort)
-              fn()
-            }
-            const onAbort = () => settle(() => reject(new Error('ask_user_question was aborted before the user answered')))
-            pendingQuestions.set(promptId, {
-              promptId,
-              agentId: r.agent !== undefined ? String(r.agent.id) : '(host)',
-              questions: r.questions.map((q) => ({
-                id: q.id,
-                question: q.question,
-                ...(q.detail !== undefined ? { detail: q.detail } : {}),
-                ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
-              })),
-              resolve: (answer) => settle(() => {
-                // 【2】web UI 提示(入队, 工具完成后安全落点): 提问已由 MCP 响应
-                if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, '✅ 提问已由 MCP 回答')
-                resolve(answer)
-              }),
-              reject: (e) => settle(() => {
-                if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, '❌ 提问已取消/失败')
-                reject(e)
-              }),
-            })
-            r.signal?.addEventListener('abort', onAbort, { once: true })
-            // 【2+3】web UI 提示: 该提问已被 MCP 拦截接管 —— ⏳ 走挂起期即时投递
-            // (notifyPromptIntercepted, 同审批; 拦截期不可直接写 user/message, 见该函数注释)
-            if (r.agent !== undefined) {
-              const first = r.questions[0]
-              notifyPromptIntercepted(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
-            }
-          })
-        },
-      })
-      questionsProviderOurs = true
-      console.log('[harness-mcp-server] user-questions provider registered (question prompts answerable via prompt_respond)')
+      legacyRegisterProvider.call(userQuestions, { ask: (request) => answerQuestionViaMcp(request) })
+      questionAnswererMode = 'legacy-provider'
     } catch {
-      questionsProviderOurs = false
-      console.warn('[harness-mcp-server] user-questions provider already registered (web GUI); question prompts route to the GUI and remain visible via progress/pending_prompts')
+      questionAnswererMode = 'none'
     }
+  } else {
+    // ② 新版宿主(≥0.2.0-rc.1): 注册到 waterfall, prepend 抢在 web GUI 的 remote listener 之前。
+    //    listener 签名 (request, next) —— 认领即返回答案(不调 next, veto 后续应答者);
+    //    不认领(非 MCP 会话/非 MCP 任务期)必须 return next() 透传给 GUI。
+    try {
+      ;(ctx.on as unknown as (name: string, listener: unknown, options?: { prepend?: boolean }) => unknown)(
+        'user-questions/request',
+        (request: unknown, next: () => Promise<unknown>): Promise<unknown> => {
+          if (!mcpOwnsQuestion(request)) return next()
+          return answerQuestionViaMcp(request)
+        },
+        { prepend: true },
+      )
+      questionAnswererMode = 'waterfall-listener'
+    } catch {
+      questionAnswererMode = 'none'
+    }
+  }
+  questionsProviderOurs = questionAnswererMode !== 'none'
+  if (questionAnswererMode === 'legacy-provider') {
+    console.log('[harness-mcp-server] user-questions answerer registered via legacy registerProvider() (dsh-user-questions ≤0.1.1); question prompts answerable via prompt_respond')
+  } else if (questionAnswererMode === 'waterfall-listener') {
+    console.log("[harness-mcp-server] user-questions answerer registered on the 'user-questions/request' waterfall, prepend (dsh-user-questions ≥0.2.0-rc.1); question prompts answerable via prompt_respond")
+  } else {
+    console.warn('[harness-mcp-server] user-questions answerer not registered (legacy host, provider slot already taken); question prompts route to the web GUI answerer and remain visible via session_status/pending_prompts')
   }
 
   const servers = new Map<string, McpServer>()
@@ -2754,35 +2882,34 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (rebindNeeded) rebind(next.host, next.port)
   }
 
-  // ── settings 命名空间注册: web 设置面板「插件配置」卡片的宿主半区 ──
-  // 入口 config 作为组合层 base(用户层未覆盖时的值); 用户经设置界面写入的值落在用户层并即时生效。
-  // 无 settings 服务的部署(headless 等)回调不触发, 保持纯入口配置行为。
-  if (typeof ctx.inject === 'function') {
-    ;(ctx.inject as unknown as (names: string[], cb: (settingsCtx: { settings: SettingsProviderLike }) => void) => unknown)(
-      ['settings'],
-      (settingsCtx: { settings: SettingsProviderLike }) => {
-    const scope = settingsCtx.settings.register(
-      settingsNamespace(SETTINGS_NAMESPACE),
-      HarnessMcpSettingsSchema,
-      {
-        base: {
-          ...(config.host !== undefined ? { host: config.host } : {}),
-          ...(config.port !== undefined ? { port: config.port } : {}),
-          ...(config.authToken !== undefined ? { authToken: config.authToken } : {}),
-        },
-        applies: 'live',
-        validate: (v) => {
-          if (!v.host || v.host.trim() === '') throw new Error('host 不能为空')
-          if (!Number.isInteger(v.port) || v.port < 1 || v.port > 65535) throw new Error('port 必须是 1-65535 的整数')
-          if (/[\r\n]/.test(v.authToken)) throw new Error('authToken 不能包含换行')
-        },
-      },
-    )
-        applyEffective(scope.get())
-        scope.watch((next) => applyEffective(next))
-      },
-    )
+  // ── 生效配置: 三个 volatile 字段(host/port/authToken) ──
+  // 入口 config 已是 schema 解析结果(默认值已填)。读取用 readField: 真实宿主把 volatile 字段
+  // 解析为 `Volatile<T>`(实现 .get()); 仓库 harness 的桩 ctx 直接传普通值 —— 两者都接受。
+  // 首次应用与初始监听相同 ⇒ applyEffective 不重复 listen; 仅 host/port 变化才 rebind。
+  const syncEffective = (): void => {
+    applyEffective({
+      host: readField(config.host, '127.0.0.1'),
+      port: readField(config.port, 8090),
+      authToken: readField(config.authToken, ''),
+    })
   }
+
+  // 首次应用: 在 effect 里执行并登记生命周期。
+  ctx.effect(() => {
+    syncEffective()
+    // 该 effect 无可释放资源(server 生命周期由下方独立 effect 管理); 返回空 disposer 满足 cordis 契约。
+    return () => {}
+  }, 'harness-mcp-server: effective-config')
+
+  // 设置页保存 volatile 字段后即时生效: dsh 0.2.0 的 loader 对 volatile-only 配置更新
+  // **不重跑插件/effect**, 而是就地更新 volatile 引用后发出 'loader/volatile-update'
+  // (源码: @deepseek-ai/cordis-plugin-loader lib/config/entry.ts `_commitVolatile` ——
+  //  updateVolatile(ref, source) 之后 fiber.ctx.emit(self, 'loader/volatile-update', paths))。
+  // 因此必须显式监听该事件, 否则保存 host/port/token 不会生效。
+  ;(ctx.on as unknown as (name: string, listener: () => void) => unknown)(
+    'loader/volatile-update',
+    () => syncEffective(),
+  )
 
   // 存量捞回: 启动后异步补挂未分组会话, 不阻塞启动; 全程兜底 try/catch 防 unhandled rejection
   void (async () => {
@@ -2803,10 +2930,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       liveAgents.clear()
       sessionToCwd.clear()
       agentLocks.clear()
-      taskQueue.clear()
-      taskCancelHooks.clear()
+      for (const off of mcpTurnWatchers.values()) { try { off() } catch { /* ignore */ } }
+      mcpTurnWatchers.clear()
+      mcpPendingTurns.clear()
       mcpSessionIds.clear()
-      mcpBusySessionIds.clear()
       sessionModelOverrides.clear()
       pendingNotices.clear()
       for (const pa of pendingApprovals.values()) pa.resolve('cancelled')
